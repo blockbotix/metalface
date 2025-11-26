@@ -1,0 +1,38 @@
+# Binaries (root level only)
+/metalface
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Models (large files)
+models/*.onnx
+models/*.pth
+models/*.pt
+models/*.bin
+
+# Test binary
+*.test
+
+# Output
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Go
+vendor/
+go.sum
+
+# Build
+dist/
+build/
