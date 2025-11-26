@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"image"
+	"image/color"
 	"time"
 
 	"gocv.io/x/gocv"
@@ -41,8 +43,8 @@ func (w *Window) Show(frame *gocv.Mat) {
 
 	// Draw FPS on frame
 	fpsText := fmt.Sprintf("FPS: %.1f", w.fps)
-	gocv.PutText(frame, fpsText, gocv.Point{X: 10, Y: 30},
-		gocv.FontHersheyPlain, 2, gocv.NewScalar(0, 255, 0, 0), 2)
+	gocv.PutText(frame, fpsText, image.Pt(10, 30),
+		gocv.FontHersheyPlain, 2, color.RGBA{R: 0, G: 255, B: 0, A: 255}, 2)
 
 	w.window.IMShow(*frame)
 }

@@ -3,7 +3,17 @@ package main
 import (
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
 	"os"
+	"os/signal"
+	"syscall"
+
+	"gocv.io/x/gocv"
+
+	"github.com/dudu/metalface/internal/camera"
+	"github.com/dudu/metalface/internal/pipeline"
+	"github.com/dudu/metalface/internal/ui"
 )
 
 type Config struct {
@@ -61,22 +71,96 @@ func parseFlags() Config {
 
 func run(config Config) error {
 	fmt.Println("MetalFace starting...")
-	fmt.Printf("Source image: %s\n", config.SourceImage)
-	fmt.Printf("Camera index: %d\n", config.CameraIndex)
-	fmt.Printf("Enhancement: %v\n", config.Enhance)
-	fmt.Printf("Virtual cam: %v\n", config.VirtualCam)
-	fmt.Printf("Preview: %v\n", config.Preview)
-	fmt.Printf("Target FPS: %d\n", config.TargetFPS)
 
-	// TODO: Implement pipeline
-	// 1. Initialize camera capture
-	// 2. Load source face and extract embedding
-	// 3. Initialize face detector
-	// 4. Initialize face swapper
-	// 5. Initialize enhancer (if enabled)
-	// 6. Initialize virtual camera (if enabled)
-	// 7. Run processing loop
+	// Create pipeline config
+	pipelineConfig := pipeline.Config{
+		SCRFDModelPath:     "models/scrfd_10g.onnx",
+		ArcFaceModelPath:   "models/arcface.onnx",
+		InswapperModelPath: "models/inswapper.onnx",
+		SourceImagePath:    config.SourceImage,
+		DetectionSize:      640,
+		ConfThreshold:      0.5,
+		NMSThreshold:       0.4,
+		BlurSize:           21,
+	}
 
-	fmt.Println("\nPipeline not yet implemented. See CLAUDE.md for development phases.")
-	return nil
+	// Initialize pipeline
+	fmt.Println("Loading models...")
+	p, err := pipeline.New(pipelineConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create pipeline: %w", err)
+	}
+	defer p.Close()
+	fmt.Println("Models loaded successfully")
+
+	// Initialize camera
+	fmt.Printf("Opening camera %d...\n", config.CameraIndex)
+	cam, err := camera.NewCapture(config.CameraIndex, config.TargetFPS)
+	if err != nil {
+		return fmt.Errorf("failed to open camera: %w", err)
+	}
+	defer cam.Close()
+	fmt.Printf("Camera opened: %dx%d\n", cam.Width(), cam.Height())
+
+	// Create preview window
+	var window *ui.Window
+	if config.Preview {
+		window = ui.NewWindow("MetalFace")
+		defer window.Close()
+	}
+
+	// Handle signals for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Main loop
+	frame := gocv.NewMat()
+	defer frame.Close()
+
+	fmt.Println("\nRunning... Press 'q' to quit")
+
+	for {
+		select {
+		case <-sigChan:
+			fmt.Println("\nShutting down...")
+			return nil
+		default:
+		}
+
+		// Capture frame
+		if !cam.Read(&frame) {
+			continue
+		}
+		if frame.Empty() {
+			continue
+		}
+
+		// Process frame
+		if err := p.Process(&frame); err != nil {
+			fmt.Printf("Warning: %v\n", err)
+		}
+
+		// Display timing
+		timing := p.LastTiming()
+		if timing.Total > 0 {
+			fps := 1000.0 / float64(timing.Total.Milliseconds())
+			timingText := fmt.Sprintf("D:%.0fms S:%.0fms T:%.0fms (%.1f FPS)",
+				float64(timing.Detection.Milliseconds()),
+				float64(timing.Swap.Milliseconds()),
+				float64(timing.Total.Milliseconds()),
+				fps)
+			gocv.PutText(&frame, timingText, image.Pt(10, 60),
+				gocv.FontHersheyPlain, 1.5, color.RGBA{R: 0, G: 255, B: 0, A: 255}, 2)
+		}
+
+		// Show preview
+		if window != nil {
+			window.Show(&frame)
+			key := window.WaitKey(1)
+			if key == 'q' || key == 27 { // 'q' or ESC
+				fmt.Println("\nQuitting...")
+				return nil
+			}
+		}
+	}
 }
