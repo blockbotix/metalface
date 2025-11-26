@@ -54,9 +54,13 @@ func (l Landmarks) AsSlice() []float32 {
 	}
 }
 
+// Landmarks106 represents 106 facial landmark points from insightface
+type Landmarks106 [106]Point
+
 // Face represents a detected face
 type Face struct {
-	BoundingBox BoundingBox
-	Landmarks   Landmarks
-	Score       float32
+	BoundingBox  BoundingBox
+	Landmarks    Landmarks    // 5-point from SCRFD
+	Landmarks106 *Landmarks106 // 106-point from 2d106det (optional)
+	Score        float32
 }

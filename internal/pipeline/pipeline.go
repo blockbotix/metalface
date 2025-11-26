@@ -13,14 +13,18 @@ import (
 
 // Config holds pipeline configuration
 type Config struct {
-	SCRFDModelPath     string
-	ArcFaceModelPath   string
-	InswapperModelPath string
-	SourceImagePath    string
-	DetectionSize      int
-	ConfThreshold      float32
-	NMSThreshold       float32
-	BlurSize           int
+	SCRFDModelPath      string
+	Landmark106Path     string
+	ArcFaceModelPath    string
+	InswapperModelPath  string
+	SourceImagePath     string
+	DetectionSize       int
+	ConfThreshold       float32
+	NMSThreshold        float32
+	BlurSize            int
+	EnableMouthMask     bool
+	EnableColorTransfer bool
+	Sharpness           float32
 }
 
 // Timing holds performance timing information
@@ -37,12 +41,23 @@ type Timing struct {
 type Pipeline struct {
 	config          Config
 	detector        *detector.SCRFD
+	landmark106     *detector.Landmark106
 	encoder         *swapper.ArcFaceEncoder
 	generator       *swapper.Inswapper
 	aligner         *swapper.FaceAligner
 	blender         *swapper.Blender
 	sourceEmbedding *swapper.Embedding
 	lastTiming      Timing
+	// Parallel detection
+	lastFaces  []detector.Face
+	detectChan chan detectResult
+	detecting  bool
+}
+
+type detectResult struct {
+	faces    []detector.Face
+	err      error
+	duration time.Duration
 }
 
 // New creates a new face swap pipeline
@@ -63,10 +78,23 @@ func New(config Config) (*Pipeline, error) {
 		return nil, fmt.Errorf("failed to create detector: %w", err)
 	}
 
+	// Create 106-point landmark detector
+	var lmk106 *detector.Landmark106
+	if config.Landmark106Path != "" {
+		lmk106, err = detector.NewLandmark106(config.Landmark106Path)
+		if err != nil {
+			det.Close()
+			return nil, fmt.Errorf("failed to create landmark detector: %w", err)
+		}
+	}
+
 	// Create encoder
 	enc, err := swapper.NewArcFaceEncoder(config.ArcFaceModelPath)
 	if err != nil {
 		det.Close()
+		if lmk106 != nil {
+			lmk106.Close()
+		}
 		return nil, fmt.Errorf("failed to create encoder: %w", err)
 	}
 
@@ -74,6 +102,9 @@ func New(config Config) (*Pipeline, error) {
 	gen, err := swapper.NewInswapper(config.InswapperModelPath)
 	if err != nil {
 		det.Close()
+		if lmk106 != nil {
+			lmk106.Close()
+		}
 		enc.Close()
 		return nil, fmt.Errorf("failed to create generator: %w", err)
 	}
@@ -83,12 +114,14 @@ func New(config Config) (*Pipeline, error) {
 	blender := swapper.NewBlender(config.BlurSize)
 
 	p := &Pipeline{
-		config:    config,
-		detector:  det,
-		encoder:   enc,
-		generator: gen,
-		aligner:   aligner,
-		blender:   blender,
+		config:      config,
+		detector:    det,
+		landmark106: lmk106,
+		encoder:     enc,
+		generator:   gen,
+		aligner:     aligner,
+		blender:     blender,
+		detectChan:  make(chan detectResult, 1),
 	}
 
 	// Load source face
@@ -139,55 +172,79 @@ func (p *Pipeline) loadSourceFace(imagePath string) error {
 	return nil
 }
 
-// Process performs face swap on a frame
+// Process performs face swap on a frame - parallel detection, sync swap
 func (p *Pipeline) Process(frame *gocv.Mat) error {
 	totalStart := time.Now()
 	var timing Timing
 
-	// Detect faces
-	detectStart := time.Now()
-	faces, err := p.detector.Detect(*frame)
-	timing.Detection = time.Since(detectStart)
-
-	if err != nil {
-		return fmt.Errorf("detection failed: %w", err)
+	// Check if previous detection finished
+	select {
+	case result := <-p.detectChan:
+		if result.err == nil {
+			p.lastFaces = result.faces
+		}
+		timing.Detection = result.duration
+		p.detecting = false
+	default:
+		timing.Detection = 0
 	}
 
-	// Process each detected face
-	for _, face := range faces {
-		// Align face for Inswapper
-		alignStart := time.Now()
-		aligned, err := p.aligner.AlignForInswapper(*frame, face.Landmarks)
-		if err != nil {
-			continue // Skip this face
-		}
-		timing.Alignment += time.Since(alignStart)
+	// Start detection for next frame in background
+	if !p.detecting {
+		p.detecting = true
+		frameCopy := frame.Clone()
+		go func() {
+			start := time.Now()
+			faces, err := p.detector.Detect(frameCopy)
+			frameCopy.Close()
+			p.detectChan <- detectResult{faces: faces, err: err, duration: time.Since(start)}
+		}()
+	}
 
-		// Swap face
+	// Perform swap synchronously on current frame using last detected faces
+	if len(p.lastFaces) > 0 {
 		swapStart := time.Now()
-		swappedFace, err := p.generator.Swap(aligned.AlignedFace, p.sourceEmbedding)
-		if err != nil {
-			aligned.AlignedFace.Close()
-			aligned.Transform.Close()
-			continue // Skip this face
-		}
-		timing.Swap += time.Since(swapStart)
-
-		// Blend onto frame
-		blendStart := time.Now()
-		p.blender.BlendFace(swappedFace, *frame, aligned.Transform, face.Landmarks)
-		timing.Blend += time.Since(blendStart)
-
-		// Cleanup
-		swappedFace.Close()
-		aligned.AlignedFace.Close()
-		aligned.Transform.Close()
+		p.processSwap(frame, p.lastFaces)
+		timing.Swap = time.Since(swapStart)
 	}
 
 	timing.Total = time.Since(totalStart)
 	p.lastTiming = timing
-
 	return nil
+}
+
+// processSwap performs the swap on a frame copy
+func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
+	for i := range faces {
+		face := &faces[i]
+
+		// Get 106-point landmarks if available
+		if p.landmark106 != nil {
+			if err := p.landmark106.Detect(*frame, face); err != nil {
+				// Continue with 5-point landmarks if 106 fails
+			}
+		}
+
+		aligned, err := p.aligner.AlignForInswapper(*frame, face.Landmarks)
+		if err != nil {
+			continue
+		}
+
+		swappedFace, err := p.generator.Swap(aligned.AlignedFace, p.sourceEmbedding)
+		if err != nil {
+			aligned.AlignedFace.Close()
+			aligned.Transform.Close()
+			continue
+		}
+
+		// Use enhanced blending with 106 landmarks
+		p.blender.BlendFaceEnhanced(swappedFace, frame, aligned.Transform, face,
+			p.config.EnableMouthMask, p.config.EnableColorTransfer, p.config.Sharpness)
+
+		swappedFace.Close()
+		aligned.AlignedFace.Close()
+		aligned.Transform.Close()
+	}
 }
 
 // LastTiming returns timing from last Process call
@@ -201,6 +258,11 @@ func (p *Pipeline) Close() error {
 
 	if p.detector != nil {
 		if err := p.detector.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if p.landmark106 != nil {
+		if err := p.landmark106.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"image/color"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"gocv.io/x/gocv"
@@ -15,6 +16,12 @@ import (
 	"github.com/dudu/metalface/internal/pipeline"
 	"github.com/dudu/metalface/internal/ui"
 )
+
+func init() {
+	// Lock the main goroutine to the main OS thread.
+	// This is required on macOS for OpenCV's highgui (window creation).
+	runtime.LockOSThread()
+}
 
 type Config struct {
 	SourceImage string
@@ -74,14 +81,18 @@ func run(config Config) error {
 
 	// Create pipeline config
 	pipelineConfig := pipeline.Config{
-		SCRFDModelPath:     "models/scrfd_10g.onnx",
-		ArcFaceModelPath:   "models/arcface.onnx",
-		InswapperModelPath: "models/inswapper.onnx",
-		SourceImagePath:    config.SourceImage,
-		DetectionSize:      640,
-		ConfThreshold:      0.5,
-		NMSThreshold:       0.4,
-		BlurSize:           21,
+		SCRFDModelPath:      "models/scrfd_10g.onnx",
+		Landmark106Path:     "models/2d106det.onnx",
+		ArcFaceModelPath:    "models/arcface.onnx",
+		InswapperModelPath:  "models/inswapper.onnx",
+		SourceImagePath:     config.SourceImage,
+		DetectionSize:       640,
+		ConfThreshold:       0.5,
+		NMSThreshold:        0.4,
+		BlurSize:            21,
+		EnableMouthMask:     true,
+		EnableColorTransfer: true,
+		Sharpness:           0.3,
 	}
 
 	// Initialize pipeline
@@ -151,12 +162,20 @@ func run(config Config) error {
 				fps)
 			gocv.PutText(&frame, timingText, image.Pt(10, 60),
 				gocv.FontHersheyPlain, 1.5, color.RGBA{R: 0, G: 255, B: 0, A: 255}, 2)
+			// Print timing to console
+			fmt.Printf("\rD:%3.0fms S:%3.0fms T:%3.0fms (%.1f FPS)  ",
+				float64(timing.Detection.Milliseconds()),
+				float64(timing.Swap.Milliseconds()),
+				float64(timing.Total.Milliseconds()),
+				fps)
 		}
 
 		// Show preview
 		if window != nil {
 			window.Show(&frame)
-			key := window.WaitKey(1)
+			// WaitKey must be called to process window events on macOS
+			// Use longer delay to ensure window renders properly
+			key := window.WaitKey(10)
 			if key == 'q' || key == 27 { // 'q' or ESC
 				fmt.Println("\nQuitting...")
 				return nil
