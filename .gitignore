@@ -36,3 +36,8 @@ go.sum
 # Build
 dist/
 build/
+converted_coreml/
+*.mlpackage
+*.pth
+modelinfo
+windowtest

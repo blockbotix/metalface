@@ -151,26 +151,25 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 	gocv.WarpAffine(swappedFace, &warpedFace, invTransform, frameSize)
 	defer warpedFace.Close()
 
-	// Create content mask (where warped face has actual pixels)
-	contentMask := b.createMaskFromContent(warpedFace)
-	defer contentMask.Close()
+	// Create ellipse mask on the 128x128 swapped face BEFORE warping
+	// This avoids warp interpolation artifacts
+	smallMask := gocv.NewMatWithSize(128, 128, gocv.MatTypeCV8U)
+	gocv.Ellipse(&smallMask,
+		image.Pt(64, 64),           // center
+		image.Pt(50, 60),           // axes (slightly smaller than 64 to avoid edges)
+		0, 0, 360,
+		color.RGBA{R: 255, G: 255, B: 255, A: 255},
+		-1,
+	)
+	defer smallMask.Close()
 
-	// Create tight ellipse mask from landmarks
-	ellipseMask := b.createEllipseMask(frame.Rows(), frame.Cols(), face.Landmarks)
-	defer ellipseMask.Close()
-
-	// Intersect: only blend where BOTH ellipse AND content exist
+	// Warp the mask using the same inverse transform
 	finalMask := gocv.NewMat()
 	defer finalMask.Close()
-	gocv.Min(contentMask, ellipseMask, &finalMask)
+	gocv.WarpAffine(smallMask, &finalMask, invTransform, frameSize)
 
-	// Heavy erosion to shrink mask away from edges
-	erodeKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(15, 15))
-	defer erodeKernel.Close()
-	gocv.Erode(finalMask, &finalMask, erodeKernel)
-
-	// Heavy blur for very soft edges (key for seamless blending)
-	gocv.GaussianBlur(finalMask, &finalMask, image.Pt(51, 51), 0, 0, gocv.BorderDefault)
+	// Blur for soft edges
+	gocv.GaussianBlur(finalMask, &finalMask, image.Pt(41, 41), 0, 0, gocv.BorderDefault)
 
 	// Use alpha blending
 	b.alphaBlend(&warpedFace, frame, finalMask)
@@ -181,34 +180,22 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 	}
 }
 
-// createMaskFromContent creates a mask from actual non-black pixels in the warped face
-// This gives a much tighter fit than ellipse-based masks
+// createMaskFromContent creates a mask from actual face pixels in the warped face
+// Uses higher threshold to exclude dark edges/artifacts
 func (b *Blender) createMaskFromContent(warpedFace gocv.Mat) gocv.Mat {
 	// Convert to grayscale
 	gray := gocv.NewMat()
 	defer gray.Close()
 	gocv.CvtColor(warpedFace, &gray, gocv.ColorBGRToGray)
 
-	// Threshold to find non-black pixels (threshold at 10 to catch very dark but not black)
+	// Medium threshold (50) - balanced between face pixels and edges
 	mask := gocv.NewMat()
-	gocv.Threshold(gray, &mask, 10, 255, gocv.ThresholdBinary)
+	gocv.Threshold(gray, &mask, 50, 255, gocv.ThresholdBinary)
 
-	// Erode to shrink mask slightly (removes edge artifacts)
-	erodeKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(5, 5))
+	// Moderate erosion (13x13) for edge cleanup
+	erodeKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(13, 13))
 	defer erodeKernel.Close()
 	gocv.Erode(mask, &mask, erodeKernel)
-
-	// Additional erosion to create more margin from edges
-	erodeKernel2 := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(7, 7))
-	defer erodeKernel2.Close()
-	gocv.Erode(mask, &mask, erodeKernel2)
-
-	// Blur for soft edges
-	blurSize := b.blurSize
-	if blurSize%2 == 0 {
-		blurSize++
-	}
-	gocv.GaussianBlur(mask, &mask, image.Pt(blurSize, blurSize), 0, 0, gocv.BorderDefault)
 
 	return mask
 }
