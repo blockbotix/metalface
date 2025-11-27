@@ -30,6 +30,7 @@ type Config struct {
 	VirtualCam  bool
 	Preview     bool
 	TargetFPS   int
+	Backend     string
 }
 
 func main() {
@@ -61,6 +62,8 @@ func parseFlags() Config {
 	flag.BoolVar(&config.Preview, "preview", true, "Show preview window")
 	flag.BoolVar(&config.Preview, "p", true, "Show preview window (shorthand)")
 	flag.IntVar(&config.TargetFPS, "fps", 30, "Target frames per second")
+	flag.StringVar(&config.Backend, "backend", "onnx", "Inference backend: onnx or coreml")
+	flag.StringVar(&config.Backend, "b", "onnx", "Inference backend (shorthand)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "MetalFace - Real-time face swapping for Apple Silicon\n\n")
@@ -69,6 +72,7 @@ func parseFlags() Config {
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg\n")
+		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --backend coreml\n")
 		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --enhance --vcam\n")
 	}
 
@@ -79,24 +83,47 @@ func parseFlags() Config {
 func run(config Config) error {
 	fmt.Println("MetalFace starting...")
 
+	// Validate backend
+	backend := pipeline.Backend(config.Backend)
+	if backend != pipeline.BackendONNX && backend != pipeline.BackendCoreML {
+		return fmt.Errorf("invalid backend: %s (use 'onnx' or 'coreml')", config.Backend)
+	}
+
+	// Configure model paths based on backend
+	var scrfdPath, arcfacePath, inswapperPath, gfpganPath string
+	if backend == pipeline.BackendCoreML {
+		scrfdPath = "converted_coreml/scrfd_10g.mlpackage"
+		arcfacePath = "converted_coreml/arcface.mlpackage"
+		inswapperPath = "converted_coreml/inswapper.mlpackage"
+		gfpganPath = "" // GFPGAN not yet converted to CoreML
+	} else {
+		scrfdPath = "models/scrfd_10g.onnx"
+		arcfacePath = "models/arcface.onnx"
+		inswapperPath = "models/inswapper.onnx"
+		gfpganPath = "models/gfpgan_1.4.onnx"
+	}
+
 	// Create pipeline config
 	pipelineConfig := pipeline.Config{
-		SCRFDModelPath:      "models/scrfd_10g.onnx",
+		SCRFDModelPath:      scrfdPath,
 		Landmark106Path:     "", // Disabled - 5-point works better for mask alignment
-		ArcFaceModelPath:    "models/arcface.onnx",
-		InswapperModelPath:  "models/inswapper.onnx",
+		ArcFaceModelPath:    arcfacePath,
+		InswapperModelPath:  inswapperPath,
+		GFPGANModelPath:     gfpganPath,
 		SourceImagePath:     config.SourceImage,
 		DetectionSize:       640,
 		ConfThreshold:       0.5,
 		NMSThreshold:        0.4,
 		BlurSize:            31, // Increased for better feathering (like Deep-Live-Cam)
 		EnableMouthMask:     false,
-		EnableColorTransfer: true, // Enable LAB color transfer
-		Sharpness:           0,    // Disable for now, can cause artifacts
+		EnableColorTransfer: true,                                       // Enable LAB color transfer
+		EnableEnhancer:      config.Enhance && backend != pipeline.BackendCoreML, // GFPGAN only on ONNX for now
+		Sharpness:           0,                                          // Disable for now, can cause artifacts
+		Backend:             backend,
 	}
 
 	// Initialize pipeline
-	fmt.Println("Loading models...")
+	fmt.Printf("Loading models (backend: %s)...\n", backend)
 	p, err := pipeline.New(pipelineConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create pipeline: %w", err)

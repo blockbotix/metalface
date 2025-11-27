@@ -78,7 +78,12 @@ func (s *Session) Run(inputData []float32, inputShape []int64, outputSize int) (
 
 // RunMulti executes inference with multiple inputs
 func (s *Session) RunMulti(inputs [][]float32, shapes [][]int64, outputSize int) ([]float32, error) {
-	return s.model.RunInferenceMulti(inputs, shapes, outputSize)
+	return s.model.RunInferenceMulti(s.inputNames, inputs, shapes, outputSize)
+}
+
+// RunMultiOutput executes inference and concatenates multiple outputs in the specified order
+func (s *Session) RunMultiOutput(inputData []float32, inputShape []int64, outputNames []string, outputSize int) ([]float32, error) {
+	return s.model.RunInferenceMultiOutput(inputData, inputShape, outputNames, outputSize)
 }
 
 // Destroy releases session resources

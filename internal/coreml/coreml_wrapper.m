@@ -155,6 +155,7 @@ int coreml_run_inference(
 
 int coreml_run_inference_multi(
     CoreMLModelHandle handle,
+    const char** input_names,
     const float** input_data_array,
     const int64_t** input_shapes,
     const int* input_ndims,
@@ -172,9 +173,9 @@ int coreml_run_inference_multi(
         NSError* error = nil;
         NSMutableDictionary* inputDict = [NSMutableDictionary dictionary];
 
-        // Create input arrays for each input
-        for (int inputIdx = 0; inputIdx < num_inputs && inputIdx < (int)wrapper.inputNames.count; inputIdx++) {
-            NSString* inputName = wrapper.inputNames[inputIdx];
+        // Create input arrays for each input using the provided input names
+        for (int inputIdx = 0; inputIdx < num_inputs; inputIdx++) {
+            NSString* inputName = [NSString stringWithUTF8String:input_names[inputIdx]];
             const float* data = input_data_array[inputIdx];
             const int64_t* shape = input_shapes[inputIdx];
             int ndims = input_ndims[inputIdx];
@@ -238,6 +239,128 @@ int coreml_run_inference_multi(
         } else {
             float* outputPtr = (float*)outputArray.dataPointer;
             memcpy(output_data, outputPtr, copySize * sizeof(float));
+        }
+
+        return 0;
+    }
+}
+
+int coreml_run_inference_multi_output(
+    CoreMLModelHandle handle,
+    const float* input_data,
+    const int64_t* input_shape,
+    int num_dims,
+    const char** output_names,
+    int num_outputs,
+    float* output_data,
+    size_t output_size
+) {
+    @autoreleasepool {
+        CoreMLModelWrapper* wrapper = (__bridge CoreMLModelWrapper*)handle;
+        if (!wrapper || !wrapper.model) {
+            lastError = @"Invalid model handle";
+            return -1;
+        }
+
+        NSError* error = nil;
+
+        // Get first input name
+        NSString* inputName = wrapper.inputNames.firstObject;
+        if (!inputName) {
+            lastError = @"No input found in model";
+            return -1;
+        }
+
+        // Calculate total size
+        int64_t totalSize = 1;
+        NSMutableArray* shapeArray = [NSMutableArray array];
+        for (int i = 0; i < num_dims; i++) {
+            totalSize *= input_shape[i];
+            [shapeArray addObject:@(input_shape[i])];
+        }
+
+        // Create MLMultiArray for input
+        MLMultiArray* inputArray = [[MLMultiArray alloc] initWithShape:shapeArray
+                                                              dataType:MLMultiArrayDataTypeFloat32
+                                                                 error:&error];
+        if (error) {
+            lastError = [NSString stringWithFormat:@"Failed to create input array: %@", error.localizedDescription];
+            return -1;
+        }
+
+        // Copy input data
+        float* inputPtr = (float*)inputArray.dataPointer;
+        memcpy(inputPtr, input_data, totalSize * sizeof(float));
+
+        // Create feature provider
+        MLDictionaryFeatureProvider* inputFeatures = [[MLDictionaryFeatureProvider alloc]
+            initWithDictionary:@{inputName: inputArray} error:&error];
+        if (error) {
+            lastError = [NSString stringWithFormat:@"Failed to create feature provider: %@", error.localizedDescription];
+            return -1;
+        }
+
+        // Run prediction
+        id<MLFeatureProvider> output = [wrapper.model predictionFromFeatures:inputFeatures error:&error];
+        if (error) {
+            lastError = [NSString stringWithFormat:@"Prediction failed: %@", error.localizedDescription];
+            return -1;
+        }
+
+        // Concatenate outputs in specified order
+        size_t offset = 0;
+        for (int i = 0; i < num_outputs && offset < output_size; i++) {
+            NSString* outputName = [NSString stringWithUTF8String:output_names[i]];
+            MLFeatureValue* outputValue = [output featureValueForName:outputName];
+
+            if (!outputValue) {
+                lastError = [NSString stringWithFormat:@"Output '%@' not found", outputName];
+                return -1;
+            }
+
+            MLMultiArray* outputArray = outputValue.multiArrayValue;
+            if (!outputArray) {
+                lastError = [NSString stringWithFormat:@"Output '%@' is not an array", outputName];
+                return -1;
+            }
+
+            size_t copySize = MIN((size_t)outputArray.count, output_size - offset);
+
+            // Copy output using getBytesWithHandler for CPU sync, with stride-aware access
+            NSArray<NSNumber*>* shape = outputArray.shape;
+            NSArray<NSNumber*>* strides = outputArray.strides;
+            NSInteger numDims = shape.count;
+            __block size_t actualCopySize = copySize;
+
+            // Extract shape and stride values outside block
+            NSInteger dim0 = numDims > 0 ? [shape[0] integerValue] : 0;
+            NSInteger dim1 = numDims > 1 ? [shape[1] integerValue] : 1;
+            NSInteger stride0 = strides.count > 0 ? [strides[0] integerValue] : 1;
+            NSInteger stride1 = strides.count > 1 ? [strides[1] integerValue] : 1;
+
+            // Use subscript access for all copying - getBytesWithHandler doesn't sync GPU data
+            if (numDims == 2) {
+                // 2D array (N, C)
+                size_t outIdx = 0;
+                for (NSInteger i0 = 0; i0 < dim0 && outIdx < actualCopySize; i0++) {
+                    for (NSInteger i1 = 0; i1 < dim1 && outIdx < actualCopySize; i1++) {
+                        output_data[offset + outIdx] = [outputArray[@[@(i0), @(i1)]] floatValue];
+                        outIdx++;
+                    }
+                }
+            } else if (numDims == 1) {
+                // 1D array
+                for (size_t j = 0; j < copySize; j++) {
+                    output_data[offset + j] = [outputArray[@[@(j)]] floatValue];
+                }
+            } else {
+                // Fallback - linear access
+                for (size_t j = 0; j < copySize; j++) {
+                    output_data[offset + j] = [[outputArray objectAtIndexedSubscript:j] floatValue];
+                }
+            }
+
+            offset += copySize;
         }
 
         return 0;

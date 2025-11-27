@@ -2,11 +2,14 @@ package pipeline
 
 import (
 	"fmt"
+	"image"
 	"time"
 
 	"gocv.io/x/gocv"
 
+	"github.com/dudu/metalface/internal/coreml"
 	"github.com/dudu/metalface/internal/detector"
+	"github.com/dudu/metalface/internal/enhancer"
 	"github.com/dudu/metalface/internal/inference"
 	"github.com/dudu/metalface/internal/swapper"
 )
@@ -17,6 +20,7 @@ type Config struct {
 	Landmark106Path     string
 	ArcFaceModelPath    string
 	InswapperModelPath  string
+	GFPGANModelPath     string
 	SourceImagePath     string
 	DetectionSize       int
 	ConfThreshold       float32
@@ -24,7 +28,9 @@ type Config struct {
 	BlurSize            int
 	EnableMouthMask     bool
 	EnableColorTransfer bool
+	EnableEnhancer      bool
 	Sharpness           float32
+	Backend             Backend // "onnx" or "coreml"
 }
 
 // Timing holds performance timing information
@@ -40,14 +46,16 @@ type Timing struct {
 // Pipeline orchestrates the face swap process
 type Pipeline struct {
 	config          Config
-	detector        *detector.SCRFD
-	landmark106     *detector.Landmark106
-	encoder         *swapper.ArcFaceEncoder
-	generator       *swapper.Inswapper
+	faceDetector    FaceDetector
+	landmarkDet     LandmarkDetector
+	encoder         FaceEncoder
+	generator       FaceSwapper
 	aligner         *swapper.FaceAligner
 	blender         *swapper.Blender
+	enhancer        *enhancer.GFPGAN
 	sourceEmbedding *swapper.Embedding
 	lastTiming      Timing
+	backend         Backend
 	// Parallel detection
 	lastFaces  []detector.Face
 	detectChan chan detectResult
@@ -64,76 +72,166 @@ type detectResult struct {
 
 // New creates a new face swap pipeline
 func New(config Config) (*Pipeline, error) {
-	// Initialize ONNX Runtime
-	fmt.Println("  Initializing ONNX Runtime...")
-	if err := inference.Initialize(); err != nil {
-		return nil, fmt.Errorf("failed to initialize inference: %w", err)
-	}
-	fmt.Println("  ONNX Runtime initialized")
-
-	// Create detector
-	fmt.Println("  Loading SCRFD detector...")
-	det, err := detector.NewSCRFD(
-		config.SCRFDModelPath,
-		config.DetectionSize,
-		config.ConfThreshold,
-		config.NMSThreshold,
+	var (
+		faceDet     FaceDetector
+		landmarkDet LandmarkDetector
+		enc         FaceEncoder
+		gen         FaceSwapper
+		err         error
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create detector: %w", err)
-	}
-	fmt.Println("  SCRFD detector loaded")
 
-	// Create 106-point landmark detector
-	var lmk106 *detector.Landmark106
-	if config.Landmark106Path != "" {
-		fmt.Printf("  Loading 106-landmark detector from %s...\n", config.Landmark106Path)
-		lmk106, err = detector.NewLandmark106(config.Landmark106Path)
+	// Default to ONNX if not specified
+	backend := config.Backend
+	if backend == "" {
+		backend = BackendONNX
+	}
+
+	// Initialize based on backend
+	if backend == BackendCoreML {
+		fmt.Println("  Initializing CoreML...")
+		if err := coreml.InitializeCoreML(); err != nil {
+			return nil, fmt.Errorf("failed to initialize CoreML: %w", err)
+		}
+		fmt.Println("  CoreML initialized")
+
+		// Create CoreML detector
+		fmt.Println("  Loading SCRFD detector (CoreML)...")
+		faceDet, err = detector.NewSCRFDCoreML(
+			config.SCRFDModelPath,
+			config.DetectionSize,
+			config.ConfThreshold,
+			config.NMSThreshold,
+		)
 		if err != nil {
-			det.Close()
-			return nil, fmt.Errorf("failed to create landmark detector: %w", err)
+			return nil, fmt.Errorf("failed to create detector: %w", err)
 		}
-		fmt.Println("  106-landmark detector loaded")
-	}
+		fmt.Println("  SCRFD detector loaded (CoreML)")
 
-	// Create encoder
-	fmt.Println("  Loading ArcFace encoder...")
-	enc, err := swapper.NewArcFaceEncoder(config.ArcFaceModelPath)
-	if err != nil {
-		det.Close()
-		if lmk106 != nil {
-			lmk106.Close()
+		// Create 106-point landmark detector
+		if config.Landmark106Path != "" {
+			fmt.Printf("  Loading 106-landmark detector (CoreML) from %s...\n", config.Landmark106Path)
+			landmarkDet, err = detector.NewLandmark106CoreML(config.Landmark106Path)
+			if err != nil {
+				faceDet.Close()
+				return nil, fmt.Errorf("failed to create landmark detector: %w", err)
+			}
+			fmt.Println("  106-landmark detector loaded (CoreML)")
 		}
-		return nil, fmt.Errorf("failed to create encoder: %w", err)
-	}
-	fmt.Println("  ArcFace encoder loaded")
 
-	// Create generator
-	fmt.Println("  Loading Inswapper generator...")
-	gen, err := swapper.NewInswapper(config.InswapperModelPath)
-	if err != nil {
-		det.Close()
-		if lmk106 != nil {
-			lmk106.Close()
+		// Create encoder
+		fmt.Println("  Loading ArcFace encoder (CoreML)...")
+		enc, err = swapper.NewArcFaceEncoderCoreML(config.ArcFaceModelPath)
+		if err != nil {
+			faceDet.Close()
+			if landmarkDet != nil {
+				landmarkDet.Close()
+			}
+			return nil, fmt.Errorf("failed to create encoder: %w", err)
 		}
-		enc.Close()
-		return nil, fmt.Errorf("failed to create generator: %w", err)
+		fmt.Println("  ArcFace encoder loaded (CoreML)")
+
+		// Create generator
+		fmt.Println("  Loading Inswapper generator (CoreML)...")
+		gen, err = swapper.NewInswapperCoreML(config.InswapperModelPath)
+		if err != nil {
+			faceDet.Close()
+			if landmarkDet != nil {
+				landmarkDet.Close()
+			}
+			enc.Close()
+			return nil, fmt.Errorf("failed to create generator: %w", err)
+		}
+		fmt.Println("  Inswapper generator loaded (CoreML)")
+	} else {
+		// ONNX backend
+		fmt.Println("  Initializing ONNX Runtime...")
+		if err := inference.Initialize(); err != nil {
+			return nil, fmt.Errorf("failed to initialize inference: %w", err)
+		}
+		fmt.Println("  ONNX Runtime initialized")
+
+		// Create ONNX detector
+		fmt.Println("  Loading SCRFD detector...")
+		faceDet, err = detector.NewSCRFD(
+			config.SCRFDModelPath,
+			config.DetectionSize,
+			config.ConfThreshold,
+			config.NMSThreshold,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create detector: %w", err)
+		}
+		fmt.Println("  SCRFD detector loaded")
+
+		// Create 106-point landmark detector
+		if config.Landmark106Path != "" {
+			fmt.Printf("  Loading 106-landmark detector from %s...\n", config.Landmark106Path)
+			landmarkDet, err = detector.NewLandmark106(config.Landmark106Path)
+			if err != nil {
+				faceDet.Close()
+				return nil, fmt.Errorf("failed to create landmark detector: %w", err)
+			}
+			fmt.Println("  106-landmark detector loaded")
+		}
+
+		// Create encoder
+		fmt.Println("  Loading ArcFace encoder...")
+		enc, err = swapper.NewArcFaceEncoder(config.ArcFaceModelPath)
+		if err != nil {
+			faceDet.Close()
+			if landmarkDet != nil {
+				landmarkDet.Close()
+			}
+			return nil, fmt.Errorf("failed to create encoder: %w", err)
+		}
+		fmt.Println("  ArcFace encoder loaded")
+
+		// Create generator
+		fmt.Println("  Loading Inswapper generator...")
+		gen, err = swapper.NewInswapper(config.InswapperModelPath)
+		if err != nil {
+			faceDet.Close()
+			if landmarkDet != nil {
+				landmarkDet.Close()
+			}
+			enc.Close()
+			return nil, fmt.Errorf("failed to create generator: %w", err)
+		}
+		fmt.Println("  Inswapper generator loaded")
 	}
-	fmt.Println("  Inswapper generator loaded")
 
 	// Create aligner and blender
 	aligner := swapper.NewFaceAligner()
 	blender := swapper.NewBlender(config.BlurSize)
 
+	// Create GFPGAN enhancer if enabled (ONNX only for now)
+	var enh *enhancer.GFPGAN
+	if config.EnableEnhancer && config.GFPGANModelPath != "" && backend == BackendONNX {
+		fmt.Println("  Loading GFPGAN enhancer...")
+		enh, err = enhancer.NewGFPGAN(config.GFPGANModelPath)
+		if err != nil {
+			faceDet.Close()
+			if landmarkDet != nil {
+				landmarkDet.Close()
+			}
+			enc.Close()
+			gen.Close()
+			return nil, fmt.Errorf("failed to create enhancer: %w", err)
+		}
+		fmt.Println("  GFPGAN enhancer loaded")
+	}
+
 	p := &Pipeline{
-		config:      config,
-		detector:    det,
-		landmark106: lmk106,
-		encoder:     enc,
-		generator:   gen,
-		aligner:     aligner,
-		blender:     blender,
-		detectChan:  make(chan detectResult, 1),
+		config:       config,
+		faceDetector: faceDet,
+		landmarkDet:  landmarkDet,
+		encoder:      enc,
+		generator:    gen,
+		aligner:      aligner,
+		blender:      blender,
+		enhancer:     enh,
+		backend:      backend,
+		detectChan:   make(chan detectResult, 1),
 	}
 
 	// Load source face
@@ -157,7 +255,7 @@ func (p *Pipeline) loadSourceFace(imagePath string) error {
 	defer img.Close()
 
 	// Detect face
-	faces, err := p.detector.Detect(img)
+	faces, err := p.faceDetector.Detect(img)
 	if err != nil {
 		return fmt.Errorf("detection failed: %w", err)
 	}
@@ -209,7 +307,7 @@ func (p *Pipeline) Process(frame *gocv.Mat) error {
 		frameCopy := frame.Clone()
 		go func() {
 			start := time.Now()
-			faces, err := p.detector.Detect(frameCopy)
+			faces, err := p.faceDetector.Detect(frameCopy)
 			frameCopy.Close()
 			p.detectChan <- detectResult{faces: faces, err: err, duration: time.Since(start)}
 		}()
@@ -248,8 +346,8 @@ func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 		face := &faces[i]
 
 		// Get 106-point landmarks if available
-		if p.landmark106 != nil {
-			if err := p.landmark106.Detect(*frame, face); err != nil {
+		if p.landmarkDet != nil {
+			if err := p.landmarkDet.Detect(*frame, face); err != nil {
 				// Landmark detection failed, will use 5-point fallback
 			}
 		}
@@ -266,11 +364,26 @@ func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 			continue
 		}
 
+		// Apply face enhancement if enabled
+		faceToBlend := swappedFace
+		if p.enhancer != nil {
+			enhanced, err := p.enhancer.Enhance(swappedFace)
+			if err == nil {
+				// Resize enhanced face back to 128x128 (original swap size)
+				resized := gocv.NewMat()
+				gocv.Resize(enhanced, &resized, image.Pt(128, 128), 0, 0, gocv.InterpolationLinear)
+				enhanced.Close()
+				swappedFace.Close()
+				faceToBlend = resized
+			}
+			// If enhancement fails, fall back to unenhanced face
+		}
+
 		// Use enhanced blending with 106 landmarks
-		p.blender.BlendFaceEnhanced(swappedFace, frame, aligned.Transform, face,
+		p.blender.BlendFaceEnhanced(faceToBlend, frame, aligned.Transform, face,
 			p.config.EnableMouthMask, p.config.EnableColorTransfer, p.config.Sharpness)
 
-		swappedFace.Close()
+		faceToBlend.Close()
 		aligned.AlignedFace.Close()
 		aligned.Transform.Close()
 	}
@@ -285,13 +398,13 @@ func (p *Pipeline) LastTiming() Timing {
 func (p *Pipeline) Close() error {
 	var errs []error
 
-	if p.detector != nil {
-		if err := p.detector.Close(); err != nil {
+	if p.faceDetector != nil {
+		if err := p.faceDetector.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if p.landmark106 != nil {
-		if err := p.landmark106.Close(); err != nil {
+	if p.landmarkDet != nil {
+		if err := p.landmarkDet.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -311,12 +424,24 @@ func (p *Pipeline) Close() error {
 	if p.blender != nil {
 		p.blender.Close()
 	}
+	if p.enhancer != nil {
+		if err := p.enhancer.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if p.previousFrame != nil {
 		p.previousFrame.Close()
 	}
 
-	if err := inference.Shutdown(); err != nil {
-		errs = append(errs, err)
+	// Shutdown the appropriate backend
+	if p.backend == BackendCoreML {
+		if err := coreml.ShutdownCoreML(); err != nil {
+			errs = append(errs, err)
+		}
+	} else {
+		if err := inference.Shutdown(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	if len(errs) > 0 {

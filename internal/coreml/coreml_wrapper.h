@@ -35,12 +35,28 @@ int coreml_run_inference(
 );
 
 // Run inference with multiple inputs (for inswapper: face + embedding)
+// input_names: array of input names in the order of input_data_array
 int coreml_run_inference_multi(
     CoreMLModelHandle handle,
+    const char** input_names,
     const float** input_data_array,
     const int64_t** input_shapes,
     const int* input_ndims,
     int num_inputs,
+    float* output_data,
+    size_t output_size
+);
+
+// Run inference with multiple outputs concatenated in specified order
+// output_names: array of output names in the order to concatenate
+// num_outputs: number of output names
+int coreml_run_inference_multi_output(
+    CoreMLModelHandle handle,
+    const float* input_data,
+    const int64_t* input_shape,
+    int num_dims,
+    const char** output_names,
+    int num_outputs,
     float* output_data,
     size_t output_size
 );

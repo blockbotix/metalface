@@ -75,8 +75,48 @@ func (m *Model) RunInference(inputData []float32, inputShape []int64, outputSize
 	return output, nil
 }
 
+// RunInferenceMultiOutput runs inference with multiple outputs concatenated in specified order
+func (m *Model) RunInferenceMultiOutput(inputData []float32, inputShape []int64, outputNames []string, outputSize int) ([]float32, error) {
+	if m.handle == nil {
+		return nil, fmt.Errorf("model not loaded")
+	}
+
+	// Convert output names to C strings
+	cOutputNames := make([]*C.char, len(outputNames))
+	for i, name := range outputNames {
+		cOutputNames[i] = C.CString(name)
+		defer C.free(unsafe.Pointer(cOutputNames[i]))
+	}
+
+	// Prepare output buffer
+	output := make([]float32, outputSize)
+
+	// Convert shape to C types
+	cInputShape := make([]C.int64_t, len(inputShape))
+	for i, s := range inputShape {
+		cInputShape[i] = C.int64_t(s)
+	}
+
+	result := C.coreml_run_inference_multi_output(
+		m.handle,
+		(*C.float)(unsafe.Pointer(&inputData[0])),
+		(*C.int64_t)(unsafe.Pointer(&cInputShape[0])),
+		C.int(len(inputShape)),
+		(**C.char)(unsafe.Pointer(&cOutputNames[0])),
+		C.int(len(outputNames)),
+		(*C.float)(unsafe.Pointer(&output[0])),
+		C.size_t(outputSize),
+	)
+
+	if result != 0 {
+		return nil, fmt.Errorf("inference failed: %s", C.GoString(C.coreml_get_error()))
+	}
+
+	return output, nil
+}
+
 // RunInferenceMulti runs inference with multiple inputs
-func (m *Model) RunInferenceMulti(inputs [][]float32, shapes [][]int64, outputSize int) ([]float32, error) {
+func (m *Model) RunInferenceMulti(inputNames []string, inputs [][]float32, shapes [][]int64, outputSize int) ([]float32, error) {
 	if m.handle == nil {
 		return nil, fmt.Errorf("model not loaded")
 	}
@@ -85,15 +125,27 @@ func (m *Model) RunInferenceMulti(inputs [][]float32, shapes [][]int64, outputSi
 	if numInputs == 0 {
 		return nil, fmt.Errorf("no inputs provided")
 	}
+	if len(inputNames) != numInputs {
+		return nil, fmt.Errorf("input names count (%d) doesn't match inputs count (%d)", len(inputNames), numInputs)
+	}
 
 	// Pin Go memory to prevent GC from moving it during C call
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
 
+	// Convert input names to C strings
+	cInputNames := make([]*C.char, numInputs)
+	for i, name := range inputNames {
+		cInputNames[i] = C.CString(name)
+		defer C.free(unsafe.Pointer(cInputNames[i]))
+	}
+
 	// Allocate C arrays to avoid CGo pointer rules violation
+	inputNamePtrs := C.malloc(C.size_t(numInputs) * C.size_t(unsafe.Sizeof(uintptr(0))))
 	inputDataPtrs := C.malloc(C.size_t(numInputs) * C.size_t(unsafe.Sizeof(uintptr(0))))
 	shapePtrs := C.malloc(C.size_t(numInputs) * C.size_t(unsafe.Sizeof(uintptr(0))))
 	ndimsArr := C.malloc(C.size_t(numInputs) * C.size_t(unsafe.Sizeof(C.int(0))))
+	defer C.free(inputNamePtrs)
 	defer C.free(inputDataPtrs)
 	defer C.free(shapePtrs)
 	defer C.free(ndimsArr)
@@ -106,6 +158,9 @@ func (m *Model) RunInferenceMulti(inputs [][]float32, shapes [][]int64, outputSi
 	}
 
 	for i := 0; i < numInputs; i++ {
+		// Set input name pointer
+		*(**C.char)(unsafe.Pointer(uintptr(inputNamePtrs) + uintptr(i)*unsafe.Sizeof(uintptr(0)))) = cInputNames[i]
+
 		// Pin the input data slice
 		pinner.Pin(&inputs[i][0])
 
@@ -131,6 +186,7 @@ func (m *Model) RunInferenceMulti(inputs [][]float32, shapes [][]int64, outputSi
 
 	result := C.coreml_run_inference_multi(
 		m.handle,
+		(**C.char)(inputNamePtrs),
 		(**C.float)(inputDataPtrs),
 		(**C.int64_t)(shapePtrs),
 		(*C.int)(ndimsArr),
