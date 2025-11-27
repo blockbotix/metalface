@@ -24,11 +24,12 @@ type SCRFD struct {
 // NewSCRFD creates a new SCRFD detector
 func NewSCRFD(modelPath string, inputSize int, confThreshold, nmsThreshold float32) (*SCRFD, error) {
 	// SCRFD has 1 input and 9 outputs (3 levels × 3 outputs each: score, bbox, kps)
+	// Output order: scores (0,1,2), bbox (3,4,5), kps (6,7,8) for strides 8,16,32
 	inputNames := []string{"input.1"}
 	outputNames := []string{
-		"score_8", "score_16", "score_32",
-		"bbox_8", "bbox_16", "bbox_32",
-		"kps_8", "kps_16", "kps_32",
+		"448", "471", "494",  // scores for stride 8, 16, 32
+		"451", "474", "497",  // bbox for stride 8, 16, 32
+		"454", "477", "500",  // kps for stride 8, 16, 32
 	}
 
 	session, err := inference.NewSession(modelPath, inputNames, outputNames)
@@ -178,7 +179,8 @@ func (s *SCRFD) postprocess(outputs []*ort.Tensor[float32], scale float32, origW
 		for y := 0; y < fmHeight; y++ {
 			for x := 0; x < fmWidth; x++ {
 				for a := 0; a < s.numAnchors; a++ {
-					score := sigmoid(scoreData[anchorIdx])
+					// Model outputs are already probabilities, no sigmoid needed
+					score := scoreData[anchorIdx]
 
 					if score > s.confThreshold {
 						// Anchor center

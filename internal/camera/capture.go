@@ -24,7 +24,9 @@ func NewCapture(deviceID int, targetFPS int) (*Capture, error) {
 		return nil, fmt.Errorf("failed to open camera %d: %w", deviceID, err)
 	}
 
-	// Set camera properties
+	// Set camera properties - use 720p for better performance
+	webcam.Set(gocv.VideoCaptureFrameWidth, 1280)
+	webcam.Set(gocv.VideoCaptureFrameHeight, 720)
 	webcam.Set(gocv.VideoCaptureFPS, float64(targetFPS))
 
 	// Get actual dimensions

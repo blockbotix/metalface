@@ -21,6 +21,9 @@ type Window struct {
 // NewWindow creates a new preview window
 func NewWindow(name string) *Window {
 	window := gocv.NewWindow(name)
+	// Force window to appear on macOS
+	window.ResizeWindow(1280, 720)
+	window.MoveWindow(100, 100)
 	return &Window{
 		window:    window,
 		name:      name,

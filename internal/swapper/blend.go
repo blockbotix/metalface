@@ -151,52 +151,66 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 	gocv.WarpAffine(swappedFace, &warpedFace, invTransform, frameSize)
 	defer warpedFace.Close()
 
-	// Create face mask using 106 landmarks if available, otherwise use 5-point
-	var mask gocv.Mat
-	if face.Landmarks106 != nil {
-		mask = b.createConvexHullMask(frame.Rows(), frame.Cols(), face.Landmarks106)
-	} else {
-		mask = b.createEllipseMask(frame.Rows(), frame.Cols(), face.Landmarks)
-	}
-	defer mask.Close()
+	// Create content mask (where warped face has actual pixels)
+	contentMask := b.createMaskFromContent(warpedFace)
+	defer contentMask.Close()
 
-	// Apply color transfer if enabled
-	if enableColorTransfer {
-		b.applyColorTransfer(&warpedFace, frame, mask)
-	}
+	// Create tight ellipse mask from landmarks
+	ellipseMask := b.createEllipseMask(frame.Rows(), frame.Cols(), face.Landmarks)
+	defer ellipseMask.Close()
 
-	// Blur mask for soft edges
-	blurredMask := gocv.NewMat()
+	// Intersect: only blend where BOTH ellipse AND content exist
+	finalMask := gocv.NewMat()
+	defer finalMask.Close()
+	gocv.Min(contentMask, ellipseMask, &finalMask)
+
+	// Heavy erosion to shrink mask away from edges
+	erodeKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(15, 15))
+	defer erodeKernel.Close()
+	gocv.Erode(finalMask, &finalMask, erodeKernel)
+
+	// Heavy blur for very soft edges (key for seamless blending)
+	gocv.GaussianBlur(finalMask, &finalMask, image.Pt(51, 51), 0, 0, gocv.BorderDefault)
+
+	// Use alpha blending
+	b.alphaBlend(&warpedFace, frame, finalMask)
+
+	// Apply sharpening if enabled (disabled for now - can add artifacts)
+	if sharpness > 0 {
+		b.applySharpening(frame, face, sharpness)
+	}
+}
+
+// createMaskFromContent creates a mask from actual non-black pixels in the warped face
+// This gives a much tighter fit than ellipse-based masks
+func (b *Blender) createMaskFromContent(warpedFace gocv.Mat) gocv.Mat {
+	// Convert to grayscale
+	gray := gocv.NewMat()
+	defer gray.Close()
+	gocv.CvtColor(warpedFace, &gray, gocv.ColorBGRToGray)
+
+	// Threshold to find non-black pixels (threshold at 10 to catch very dark but not black)
+	mask := gocv.NewMat()
+	gocv.Threshold(gray, &mask, 10, 255, gocv.ThresholdBinary)
+
+	// Erode to shrink mask slightly (removes edge artifacts)
+	erodeKernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(5, 5))
+	defer erodeKernel.Close()
+	gocv.Erode(mask, &mask, erodeKernel)
+
+	// Additional erosion to create more margin from edges
+	erodeKernel2 := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(7, 7))
+	defer erodeKernel2.Close()
+	gocv.Erode(mask, &mask, erodeKernel2)
+
+	// Blur for soft edges
 	blurSize := b.blurSize
 	if blurSize%2 == 0 {
 		blurSize++
 	}
-	gocv.GaussianBlur(mask, &blurredMask, image.Pt(blurSize, blurSize), 0, 0, gocv.BorderDefault)
-	defer blurredMask.Close()
+	gocv.GaussianBlur(mask, &mask, image.Pt(blurSize, blurSize), 0, 0, gocv.BorderDefault)
 
-	// Store original frame for mouth preservation
-	var originalFrame gocv.Mat
-	var mouthMask gocv.Mat
-	var mouthBox image.Rectangle
-	if enableMouthMask && face.Landmarks106 != nil {
-		originalFrame = frame.Clone()
-		defer originalFrame.Close()
-		mouthMask, mouthBox = b.createMouthMask(frame.Rows(), frame.Cols(), face.Landmarks106)
-		defer mouthMask.Close()
-	}
-
-	// Blend the swapped face onto the frame
-	warpedFace.CopyToWithMask(frame, blurredMask)
-
-	// Restore mouth area from original frame if enabled
-	if enableMouthMask && face.Landmarks106 != nil && !mouthMask.Empty() {
-		b.restoreMouthArea(frame, &originalFrame, mouthMask, mouthBox)
-	}
-
-	// Apply sharpening if enabled
-	if sharpness > 0 {
-		b.applySharpening(frame, face, sharpness)
-	}
+	return mask
 }
 
 // createConvexHullMask creates a mask from the convex hull of 106 landmarks
@@ -206,21 +220,21 @@ func (b *Blender) createConvexHullMask(height, width int, landmarks *detector.La
 	// Get face outline indices (0-32 for chin to ears)
 	outlineIndices := detector.GetFaceOutlineIndices()
 	points := landmarks.GetPoints(outlineIndices)
+	imgPoints := b.pointsToImagePoints(points)
 
-	// Convert to gocv.PointVector for convex hull
-	pointsVec := gocv.NewPointVectorFromPoints(b.pointsToImagePoints(points))
-	defer pointsVec.Close()
-
-	// Compute convex hull
-	hull := gocv.NewMat()
-	defer hull.Close()
-	gocv.ConvexHull(pointsVec, &hull, true, false)
+	// Use our own convex hull implementation that returns actual points
+	hullPoints := detector.ConvexHull(points)
+	hullImgPoints := b.pointsToImagePoints(hullPoints)
 
 	// Draw filled convex hull
-	if !hull.Empty() {
-		hullPoints := b.matToPoints(hull)
-		if len(hullPoints) >= 3 {
-			ptsVec := gocv.NewPointsVectorFromPoints([][]image.Point{hullPoints})
+	if len(hullImgPoints) >= 3 {
+		ptsVec := gocv.NewPointsVectorFromPoints([][]image.Point{hullImgPoints})
+		defer ptsVec.Close()
+		gocv.FillPoly(&mask, ptsVec, color.RGBA{R: 255, G: 255, B: 255, A: 255})
+	} else {
+		// Fallback: just draw polygon from outline points
+		if len(imgPoints) >= 3 {
+			ptsVec := gocv.NewPointsVectorFromPoints([][]image.Point{imgPoints})
 			defer ptsVec.Close()
 			gocv.FillPoly(&mask, ptsVec, color.RGBA{R: 255, G: 255, B: 255, A: 255})
 		}
@@ -229,20 +243,58 @@ func (b *Blender) createConvexHullMask(height, width int, landmarks *detector.La
 	return mask
 }
 
+// createEllipseMaskFrom106 creates an elliptical mask from 106 landmarks (current frame)
+func (b *Blender) createEllipseMaskFrom106(height, width int, landmarks *detector.Landmarks106) gocv.Mat {
+	mask := gocv.NewMatWithSize(height, width, gocv.MatTypeCV8U)
+
+	// Calculate bounding box from face outline (indices 0-32)
+	minX, minY := float32(width), float32(height)
+	maxX, maxY := float32(0), float32(0)
+	for i := 0; i <= 32; i++ {
+		if landmarks[i].X < minX {
+			minX = landmarks[i].X
+		}
+		if landmarks[i].X > maxX {
+			maxX = landmarks[i].X
+		}
+		if landmarks[i].Y < minY {
+			minY = landmarks[i].Y
+		}
+		if landmarks[i].Y > maxY {
+			maxY = landmarks[i].Y
+		}
+	}
+
+	// Face center and size from bounding box
+	centerX := (minX + maxX) / 2
+	// Shift center up - use 40% from top instead of 50% to avoid chin area
+	centerY := minY + (maxY-minY)*0.4
+	faceWidth := (maxX - minX) * 0.85  // Slightly less than full width
+	faceHeight := (maxY - minY) * 0.7  // Reduced height, centered higher
+
+	gocv.Ellipse(&mask,
+		image.Pt(int(centerX), int(centerY)),
+		image.Pt(int(faceWidth/2), int(faceHeight/2)),
+		0, 0, 360,
+		color.RGBA{R: 255, G: 255, B: 255, A: 255},
+		-1,
+	)
+
+	return mask
+}
+
 // createEllipseMask creates an elliptical mask from 5-point landmarks (fallback)
 func (b *Blender) createEllipseMask(height, width int, landmarks detector.Landmarks) gocv.Mat {
 	mask := gocv.NewMatWithSize(height, width, gocv.MatTypeCV8U)
 
-	// Face center
-	centerX := (landmarks.LeftEye.X + landmarks.RightEye.X + landmarks.Nose.X +
-		landmarks.LeftMouth.X + landmarks.RightMouth.X) / 5
-	centerY := (landmarks.LeftEye.Y + landmarks.RightEye.Y + landmarks.Nose.Y +
-		landmarks.LeftMouth.Y + landmarks.RightMouth.Y) / 5
+	// Face center - shift up slightly to avoid throat area
+	centerX := (landmarks.LeftEye.X + landmarks.RightEye.X) / 2
+	centerY := (landmarks.LeftEye.Y + landmarks.RightEye.Y + landmarks.Nose.Y) / 3
 
-	// Face size based on eye distance
+	// Face size based on eye distance - reduce height to avoid black throat area
 	eyeDist := landmarks.RightEye.X - landmarks.LeftEye.X
-	faceWidth := eyeDist * 2.5
-	faceHeight := eyeDist * 3.0
+	faceWidth := eyeDist * 2.2
+	faceHeight := eyeDist * 2.5 // Reduced from 3.0 to avoid throat
 
 	gocv.Ellipse(&mask,
 		image.Pt(int(centerX), int(centerY)),
@@ -439,6 +491,54 @@ func (b *Blender) applySharpening(frame *gocv.Mat, face *detector.Face, sharpnes
 	sharpened.CopyTo(&roi)
 }
 
+// alphaBlend performs proper alpha blending: result = src * alpha + dst * (1 - alpha)
+func (b *Blender) alphaBlend(src, dst *gocv.Mat, mask gocv.Mat) {
+	// Convert mask to 3 channels
+	mask3ch := gocv.NewMat()
+	defer mask3ch.Close()
+	gocv.CvtColor(mask, &mask3ch, gocv.ColorGrayToBGR)
+
+	// Convert to float32 for blending
+	srcFloat := gocv.NewMat()
+	defer srcFloat.Close()
+	dstFloat := gocv.NewMat()
+	defer dstFloat.Close()
+	maskFloat := gocv.NewMat()
+	defer maskFloat.Close()
+
+	src.ConvertTo(&srcFloat, gocv.MatTypeCV32FC3)
+	dst.ConvertTo(&dstFloat, gocv.MatTypeCV32FC3)
+	mask3ch.ConvertTo(&maskFloat, gocv.MatTypeCV32FC3)
+
+	// Normalize mask to 0-1 by dividing by 255
+	maskFloat.DivideFloat(255.0)
+
+	// Calculate inverse mask (1 - alpha)
+	invMask := gocv.NewMat()
+	defer invMask.Close()
+	ones := gocv.NewMatWithSizeFromScalar(gocv.NewScalar(1.0, 1.0, 1.0, 0), mask.Rows(), mask.Cols(), gocv.MatTypeCV32FC3)
+	defer ones.Close()
+	gocv.Subtract(ones, maskFloat, &invMask)
+
+	// src * alpha
+	srcWeighted := gocv.NewMat()
+	defer srcWeighted.Close()
+	gocv.Multiply(srcFloat, maskFloat, &srcWeighted)
+
+	// dst * (1 - alpha)
+	dstWeighted := gocv.NewMat()
+	defer dstWeighted.Close()
+	gocv.Multiply(dstFloat, invMask, &dstWeighted)
+
+	// result = src * alpha + dst * (1 - alpha)
+	resultFloat := gocv.NewMat()
+	defer resultFloat.Close()
+	gocv.Add(srcWeighted, dstWeighted, &resultFloat)
+
+	// Convert back to uint8
+	resultFloat.ConvertTo(dst, gocv.MatTypeCV8UC3)
+}
+
 // Helper functions
 func (b *Blender) pointsToImagePoints(points []detector.Point) []image.Point {
 	result := make([]image.Point, len(points))
@@ -446,16 +546,6 @@ func (b *Blender) pointsToImagePoints(points []detector.Point) []image.Point {
 		result[i] = image.Pt(int(p.X), int(p.Y))
 	}
 	return result
-}
-
-func (b *Blender) matToPoints(mat gocv.Mat) []image.Point {
-	rows := mat.Rows()
-	points := make([]image.Point, rows)
-	for i := 0; i < rows; i++ {
-		// ConvexHull returns indices, get actual point coordinates
-		points[i] = image.Pt(int(mat.GetFloatAt(i, 0)), int(mat.GetFloatAt(i, 1)))
-	}
-	return points
 }
 
 func max(a, b int) int {

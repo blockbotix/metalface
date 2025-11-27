@@ -22,8 +22,8 @@ type ArcFaceEncoder struct {
 // NewArcFaceEncoder creates a new ArcFace encoder
 func NewArcFaceEncoder(modelPath string) (*ArcFaceEncoder, error) {
 	// ArcFace has 1 input and 1 output
-	inputNames := []string{"input.1"}
-	outputNames := []string{"683"} // output node name from model
+	inputNames := []string{"input"}
+	outputNames := []string{"output"}
 
 	session, err := inference.NewSession(modelPath, inputNames, outputNames)
 	if err != nil {

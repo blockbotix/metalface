@@ -21,7 +21,8 @@ func Initialize() error {
 		return nil
 	}
 
-	ort.SetSharedLibraryPath("/opt/homebrew/lib/libonnxruntime.dylib")
+	// Use official ONNX Runtime with CoreML support
+	ort.SetSharedLibraryPath("lib/libonnxruntime.dylib")
 
 	if err := ort.InitializeEnvironment(); err != nil {
 		return fmt.Errorf("failed to initialize ONNX Runtime: %w", err)
@@ -56,17 +57,34 @@ type Session struct {
 	outputNames []string
 }
 
-// NewSession creates a new inference session from an ONNX model
+// NewSession creates a new inference session from an ONNX model with CoreML acceleration
 func NewSession(modelPath string, inputNames, outputNames []string) (*Session, error) {
 	if !initialized {
 		return nil, fmt.Errorf("ONNX Runtime not initialized, call Initialize() first")
+	}
+
+	// Create session options with CoreML execution provider
+	options, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session options: %w", err)
+	}
+	defer options.Destroy()
+
+	// Enable CoreML execution provider for GPU acceleration on macOS
+	// Flag 0 = default settings, use Neural Engine + GPU
+	err = options.AppendExecutionProviderCoreML(0)
+	if err != nil {
+		// CoreML not available, continue with CPU
+		fmt.Printf("    [CPU] %s - CoreML failed: %v\n", modelPath, err)
+	} else {
+		fmt.Printf("    [CoreML] %s\n", modelPath)
 	}
 
 	session, err := ort.NewDynamicAdvancedSession(
 		modelPath,
 		inputNames,
 		outputNames,
-		nil, // use default options
+		options,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session for %s: %w", modelPath, err)

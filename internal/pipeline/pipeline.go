@@ -52,6 +52,8 @@ type Pipeline struct {
 	lastFaces  []detector.Face
 	detectChan chan detectResult
 	detecting  bool
+	// Frame interpolation for temporal smoothness
+	previousFrame *gocv.Mat
 }
 
 type detectResult struct {
@@ -63,11 +65,14 @@ type detectResult struct {
 // New creates a new face swap pipeline
 func New(config Config) (*Pipeline, error) {
 	// Initialize ONNX Runtime
+	fmt.Println("  Initializing ONNX Runtime...")
 	if err := inference.Initialize(); err != nil {
 		return nil, fmt.Errorf("failed to initialize inference: %w", err)
 	}
+	fmt.Println("  ONNX Runtime initialized")
 
 	// Create detector
+	fmt.Println("  Loading SCRFD detector...")
 	det, err := detector.NewSCRFD(
 		config.SCRFDModelPath,
 		config.DetectionSize,
@@ -77,18 +82,22 @@ func New(config Config) (*Pipeline, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create detector: %w", err)
 	}
+	fmt.Println("  SCRFD detector loaded")
 
 	// Create 106-point landmark detector
 	var lmk106 *detector.Landmark106
 	if config.Landmark106Path != "" {
+		fmt.Printf("  Loading 106-landmark detector from %s...\n", config.Landmark106Path)
 		lmk106, err = detector.NewLandmark106(config.Landmark106Path)
 		if err != nil {
 			det.Close()
 			return nil, fmt.Errorf("failed to create landmark detector: %w", err)
 		}
+		fmt.Println("  106-landmark detector loaded")
 	}
 
 	// Create encoder
+	fmt.Println("  Loading ArcFace encoder...")
 	enc, err := swapper.NewArcFaceEncoder(config.ArcFaceModelPath)
 	if err != nil {
 		det.Close()
@@ -97,8 +106,10 @@ func New(config Config) (*Pipeline, error) {
 		}
 		return nil, fmt.Errorf("failed to create encoder: %w", err)
 	}
+	fmt.Println("  ArcFace encoder loaded")
 
 	// Create generator
+	fmt.Println("  Loading Inswapper generator...")
 	gen, err := swapper.NewInswapper(config.InswapperModelPath)
 	if err != nil {
 		det.Close()
@@ -108,6 +119,7 @@ func New(config Config) (*Pipeline, error) {
 		enc.Close()
 		return nil, fmt.Errorf("failed to create generator: %w", err)
 	}
+	fmt.Println("  Inswapper generator loaded")
 
 	// Create aligner and blender
 	aligner := swapper.NewFaceAligner()
@@ -125,10 +137,12 @@ func New(config Config) (*Pipeline, error) {
 	}
 
 	// Load source face
+	fmt.Println("  Loading source face...")
 	if err := p.loadSourceFace(config.SourceImagePath); err != nil {
 		p.Close()
 		return nil, fmt.Errorf("failed to load source face: %w", err)
 	}
+	fmt.Println("  Source face loaded")
 
 	return p, nil
 }
@@ -206,6 +220,21 @@ func (p *Pipeline) Process(frame *gocv.Mat) error {
 		swapStart := time.Now()
 		p.processSwap(frame, p.lastFaces)
 		timing.Swap = time.Since(swapStart)
+
+		// Frame interpolation: blend with previous frame for temporal smoothness
+		// This reduces flicker (like Deep-Live-Cam's 20% interpolation)
+		if p.previousFrame != nil && !p.previousFrame.Empty() {
+			// Blend: 80% current + 20% previous
+			gocv.AddWeighted(*frame, 0.8, *p.previousFrame, 0.2, 0, frame)
+		}
+
+		// Store current frame for next iteration
+		if p.previousFrame == nil {
+			prevFrame := frame.Clone()
+			p.previousFrame = &prevFrame
+		} else {
+			frame.CopyTo(p.previousFrame)
+		}
 	}
 
 	timing.Total = time.Since(totalStart)
@@ -221,7 +250,7 @@ func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 		// Get 106-point landmarks if available
 		if p.landmark106 != nil {
 			if err := p.landmark106.Detect(*frame, face); err != nil {
-				// Continue with 5-point landmarks if 106 fails
+				// Landmark detection failed, will use 5-point fallback
 			}
 		}
 
@@ -281,6 +310,9 @@ func (p *Pipeline) Close() error {
 	}
 	if p.blender != nil {
 		p.blender.Close()
+	}
+	if p.previousFrame != nil {
+		p.previousFrame.Close()
 	}
 
 	if err := inference.Shutdown(); err != nil {

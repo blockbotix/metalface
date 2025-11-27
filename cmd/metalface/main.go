@@ -82,17 +82,17 @@ func run(config Config) error {
 	// Create pipeline config
 	pipelineConfig := pipeline.Config{
 		SCRFDModelPath:      "models/scrfd_10g.onnx",
-		Landmark106Path:     "models/2d106det.onnx",
+		Landmark106Path:     "", // Disabled - 5-point works better for mask alignment
 		ArcFaceModelPath:    "models/arcface.onnx",
 		InswapperModelPath:  "models/inswapper.onnx",
 		SourceImagePath:     config.SourceImage,
 		DetectionSize:       640,
 		ConfThreshold:       0.5,
 		NMSThreshold:        0.4,
-		BlurSize:            21,
-		EnableMouthMask:     true,
-		EnableColorTransfer: true,
-		Sharpness:           0.3,
+		BlurSize:            31, // Increased for better feathering (like Deep-Live-Cam)
+		EnableMouthMask:     false,
+		EnableColorTransfer: true, // Enable LAB color transfer
+		Sharpness:           0,    // Disable for now, can cause artifacts
 	}
 
 	// Initialize pipeline
