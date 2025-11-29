@@ -32,6 +32,7 @@ type Config struct {
 	TargetFPS   int
 	Backend     string
 	Model       string
+	Resolution  string // "720p", "480p", "360p"
 }
 
 func main() {
@@ -67,6 +68,8 @@ func parseFlags() Config {
 	flag.StringVar(&config.Backend, "b", "onnx", "Inference backend (shorthand)")
 	flag.StringVar(&config.Model, "model", "inswapper", "Face swap model: inswapper or simswap512")
 	flag.StringVar(&config.Model, "m", "inswapper", "Face swap model (shorthand)")
+	flag.StringVar(&config.Resolution, "resolution", "720p", "Camera resolution: 720p, 480p, 360p")
+	flag.StringVar(&config.Resolution, "r", "720p", "Camera resolution (shorthand)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "MetalFace - Real-time face swapping for Apple Silicon\n\n")
@@ -77,7 +80,8 @@ func parseFlags() Config {
 		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg\n")
 		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --backend coreml\n")
 		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --model simswap512\n")
-		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --enhance --vcam\n")
+		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --resolution 480p\n")
+		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --enhance gpen256 --vcam\n")
 	}
 
 	flag.Parse()
@@ -156,7 +160,7 @@ func run(config Config) error {
 		BlurSize:            31, // Increased for better feathering (like Deep-Live-Cam)
 		EnableMouthMask:     false,
 		EnableColorTransfer: true, // Enable LAB color transfer
-		Sharpness:           0,    // Disable for now, can cause artifacts
+		Sharpness:           0.5,  // Light sharpening to reduce pixelation from 128x128 upscale
 		Backend:             backend,
 		Model:               model,
 		Enhancer:            enhancerType,
@@ -171,9 +175,22 @@ func run(config Config) error {
 	defer p.Close()
 	fmt.Println("Models loaded successfully")
 
+	// Parse resolution
+	var camWidth, camHeight int
+	switch config.Resolution {
+	case "720p":
+		camWidth, camHeight = 1280, 720
+	case "480p":
+		camWidth, camHeight = 854, 480
+	case "360p":
+		camWidth, camHeight = 640, 360
+	default:
+		return fmt.Errorf("invalid resolution: %s (use 720p, 480p, or 360p)", config.Resolution)
+	}
+
 	// Initialize camera
-	fmt.Printf("Opening camera %d...\n", config.CameraIndex)
-	cam, err := camera.NewCapture(config.CameraIndex, config.TargetFPS)
+	fmt.Printf("Opening camera %d at %s (%dx%d)...\n", config.CameraIndex, config.Resolution, camWidth, camHeight)
+	cam, err := camera.NewCaptureWithResolution(config.CameraIndex, config.TargetFPS, camWidth, camHeight)
 	if err != nil {
 		return fmt.Errorf("failed to open camera: %w", err)
 	}

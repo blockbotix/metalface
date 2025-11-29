@@ -17,7 +17,9 @@ type ArcFaceEncoderCoreML struct {
 
 // NewArcFaceEncoderCoreML creates a new ArcFace encoder using CoreML
 func NewArcFaceEncoderCoreML(modelPath string) (*ArcFaceEncoderCoreML, error) {
-	inputNames := []string{"input"}
+	// w600k_r50.onnx has input.1 which becomes input_1 in CoreML
+	// Output is var_1110 (512-dim embedding)
+	inputNames := []string{"input_1"}
 	outputNames := []string{"var_1110"}
 
 	session, err := coreml.NewSession(modelPath, inputNames, outputNames)
@@ -52,20 +54,16 @@ func (e *ArcFaceEncoderCoreML) Extract(alignedFace gocv.Mat) (*Embedding, error)
 }
 
 // preprocess converts aligned face to model input format
+// Matches insightface ArcFace preprocessing:
+// blob = cv2.dnn.blobFromImage(img, 1.0/input_std, input_size, (input_mean,)*3, swapRB=True)
+// where input_std=127.5, input_mean=127.5, resulting in (x-127.5)/127.5 = (x/127.5 - 1)
 func (e *ArcFaceEncoderCoreML) preprocess(img gocv.Mat) []float32 {
-	// Convert BGR to RGB
-	rgb := gocv.NewMat()
-	gocv.CvtColor(img, &rgb, gocv.ColorBGRToRGB)
-	defer rgb.Close()
-
-	// Convert to float and normalize to [0, 1]
-	floatImg := gocv.NewMat()
-	rgb.ConvertTo(&floatImg, gocv.MatTypeCV32FC3)
-	defer floatImg.Close()
-
-	// Create blob (HWC to NCHW)
-	blob := gocv.BlobFromImage(floatImg, 1.0/255.0, image.Pt(112, 112),
-		gocv.NewScalar(0, 0, 0, 0), false, false)
+	// ArcFace uses [-1, 1] normalization: (pixel - 127.5) / 127.5
+	// BlobFromImage formula: out = (in - mean) * scale
+	// We need: out = (in - 127.5) / 127.5 = in/127.5 - 1
+	// So: scale = 1/127.5, mean = 127.5
+	blob := gocv.BlobFromImage(img, 1.0/127.5, image.Pt(112, 112),
+		gocv.NewScalar(127.5, 127.5, 127.5, 0), true, false)
 	defer blob.Close()
 
 	blobData := blob.ToBytes()

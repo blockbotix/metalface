@@ -17,28 +17,33 @@ type Capture struct {
 	mu        sync.Mutex
 }
 
-// NewCapture creates a new camera capture from device
+// NewCapture creates a new camera capture from device with default 720p resolution
 func NewCapture(deviceID int, targetFPS int) (*Capture, error) {
+	return NewCaptureWithResolution(deviceID, targetFPS, 1280, 720)
+}
+
+// NewCaptureWithResolution creates a new camera capture with specified resolution
+func NewCaptureWithResolution(deviceID int, targetFPS int, width, height int) (*Capture, error) {
 	webcam, err := gocv.OpenVideoCapture(deviceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open camera %d: %w", deviceID, err)
 	}
 
-	// Set camera properties - use 720p for better performance
-	webcam.Set(gocv.VideoCaptureFrameWidth, 1280)
-	webcam.Set(gocv.VideoCaptureFrameHeight, 720)
+	// Set camera properties
+	webcam.Set(gocv.VideoCaptureFrameWidth, float64(width))
+	webcam.Set(gocv.VideoCaptureFrameHeight, float64(height))
 	webcam.Set(gocv.VideoCaptureFPS, float64(targetFPS))
 
-	// Get actual dimensions
-	width := int(webcam.Get(gocv.VideoCaptureFrameWidth))
-	height := int(webcam.Get(gocv.VideoCaptureFrameHeight))
+	// Get actual dimensions (camera may not support requested resolution)
+	actualWidth := int(webcam.Get(gocv.VideoCaptureFrameWidth))
+	actualHeight := int(webcam.Get(gocv.VideoCaptureFrameHeight))
 
 	return &Capture{
 		webcam:    webcam,
 		deviceID:  deviceID,
 		targetFPS: targetFPS,
-		width:     width,
-		height:    height,
+		width:     actualWidth,
+		height:    actualHeight,
 	}, nil
 }
 

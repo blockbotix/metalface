@@ -1,9 +1,11 @@
 package pipeline
 
 import (
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
+	"math"
 	"os"
 	"time"
 
@@ -367,6 +369,10 @@ func (p *Pipeline) loadSourceFace(imagePath string) error {
 
 	// Use first detected face
 	face := faces[0]
+	fmt.Printf("  Face landmarks: LE(%.1f,%.1f) RE(%.1f,%.1f) N(%.1f,%.1f)\n",
+		face.Landmarks.LeftEye.X, face.Landmarks.LeftEye.Y,
+		face.Landmarks.RightEye.X, face.Landmarks.RightEye.Y,
+		face.Landmarks.Nose.X, face.Landmarks.Nose.Y)
 
 	// Align face for ArcFace
 	aligned, err := p.aligner.AlignForArcFace(img, face.Landmarks)
@@ -382,11 +388,55 @@ func (p *Pipeline) loadSourceFace(imagePath string) error {
 		return fmt.Errorf("embedding extraction failed: %w", err)
 	}
 
+	// Debug: print first 10 embedding values
+	fmt.Printf("  Source embedding (first 10): [")
+	for i := 0; i < 10; i++ {
+		fmt.Printf("%.4f", embedding[i])
+		if i < 9 {
+			fmt.Print(", ")
+		}
+	}
+	fmt.Println("]")
+
 	// Apply emap transformation only for inswapper model
 	// This transforms ArcFace embedding to inswapper latent space
 	// SimSwap uses raw ArcFace embedding directly
 	if p.emap != nil && p.modelType == ModelInswapper {
 		embedding = p.emap.TransformEmbedding(embedding)
+		fmt.Printf("  Transformed latent (first 10): [")
+		for i := 0; i < 10; i++ {
+			fmt.Printf("%.4f", embedding[i])
+			if i < 9 {
+				fmt.Print(", ")
+			}
+		}
+		fmt.Println("]")
+	}
+
+	// Check if we should use a pre-computed Python embedding for testing
+	if latentFile := os.Getenv("METALFACE_LATENT_FILE"); latentFile != "" {
+		fmt.Printf("  Loading Python latent from %s...\n", latentFile)
+		data, err := os.ReadFile(latentFile)
+		if err != nil {
+			return fmt.Errorf("failed to read latent file: %w", err)
+		}
+		if len(data) != 512*4 {
+			return fmt.Errorf("latent file size mismatch: expected %d, got %d", 512*4, len(data))
+		}
+		var pyLatent swapper.Embedding
+		for i := 0; i < 512; i++ {
+			bits := binary.LittleEndian.Uint32(data[i*4 : i*4+4])
+			pyLatent[i] = math.Float32frombits(bits)
+		}
+		fmt.Printf("  Python latent (first 10): [")
+		for i := 0; i < 10; i++ {
+			fmt.Printf("%.4f", pyLatent[i])
+			if i < 9 {
+				fmt.Print(", ")
+			}
+		}
+		fmt.Println("]")
+		embedding = &pyLatent
 	}
 
 	p.sourceEmbedding = embedding
@@ -465,6 +515,9 @@ func (p *Pipeline) Process(frame *gocv.Mat) error {
 	return nil
 }
 
+// Debug counter for saving intermediate results
+var debugFrameCount int
+
 // processSwap performs the swap on a frame copy
 func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 	for i := range faces {
@@ -509,11 +562,24 @@ func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 			continue
 		}
 
+		// Debug: save aligned face on first frame
+		if debugFrameCount == 0 && os.Getenv("METALFACE_DEBUG_SWAP") == "1" {
+			gocv.IMWrite("go_aligned_128.jpg", aligned.AlignedFace)
+			fmt.Println("  [DEBUG] Saved go_aligned_128.jpg")
+		}
+
 		swappedFace, err := p.generator.Swap(aligned.AlignedFace, p.sourceEmbedding)
 		if err != nil {
 			aligned.AlignedFace.Close()
 			aligned.Transform.Close()
 			continue
+		}
+
+		// Debug: save raw swap result on first frame
+		if debugFrameCount == 0 && os.Getenv("METALFACE_DEBUG_SWAP") == "1" {
+			gocv.IMWrite("go_swap_result.jpg", swappedFace)
+			fmt.Println("  [DEBUG] Saved go_swap_result.jpg")
+			debugFrameCount++
 		}
 
 		// Apply face enhancement if enabled

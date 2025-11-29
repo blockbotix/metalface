@@ -110,24 +110,14 @@ func (s *SimSwap512) Swap(targetFace gocv.Mat, sourceEmbedding *Embedding) (gocv
 }
 
 // preprocessTarget converts target face to model input format
-// SimSwap uses [-1, 1] normalization: (x / 255.0 - 0.5) / 0.5 = x / 127.5 - 1
+// SimSwap 512 unofficial expects RGB input normalized to [0, 1] range
 func (s *SimSwap512) preprocessTarget(img gocv.Mat) []float32 {
-	// Convert BGR to RGB
-	rgb := gocv.NewMat()
-	gocv.CvtColor(img, &rgb, gocv.ColorBGRToRGB)
-	defer rgb.Close()
-
-	// Convert to float
-	floatImg := gocv.NewMat()
-	rgb.ConvertTo(&floatImg, gocv.MatTypeCV32FC3)
-	defer floatImg.Close()
-
-	// Create blob and normalize to [-1, 1] range
-	// BlobFromImage: output = (input - mean) * scalefactor
-	// For [-1, 1]: we need (x - 127.5) / 127.5 = x/127.5 - 1
-	// So: scalefactor = 1/127.5, mean = 127.5
-	blob := gocv.BlobFromImage(floatImg, 1.0/127.5, image.Pt(512, 512),
-		gocv.NewScalar(127.5, 127.5, 127.5, 0), false, false)
+	// BlobFromImage with:
+	// - scalefactor = 1/255.0 for [0, 1] normalization
+	// - swapRB = true to convert BGR (OpenCV) to RGB (model expects RGB)
+	// - crop = false
+	blob := gocv.BlobFromImage(img, 1.0/255.0, image.Pt(512, 512),
+		gocv.NewScalar(0, 0, 0, 0), true, false)
 	defer blob.Close()
 
 	// Extract data
@@ -156,20 +146,20 @@ func (s *SimSwap512) postprocess(data []float32) gocv.Mat {
 
 	for y := 0; y < 512; y++ {
 		for x := 0; x < 512; x++ {
-			// Get RGB values from CHW layout
+			// Get RGB values from CHW layout (model outputs RGB)
 			rIdx := 0*512*512 + y*512 + x
 			gIdx := 1*512*512 + y*512 + x
 			bIdx := 2*512*512 + y*512 + x
 
-			// Try [0, 1] output range
+			// Output is in [0, 1] range, convert to [0, 255]
 			r := clampByte(data[rIdx] * 255.0)
 			g := clampByte(data[gIdx] * 255.0)
 			b := clampByte(data[bIdx] * 255.0)
 
-			// Set BGR pixel
-			result.SetUCharAt(y, x*3+0, b)
-			result.SetUCharAt(y, x*3+1, g)
-			result.SetUCharAt(y, x*3+2, r)
+			// Write as BGR for OpenCV (swap R and B)
+			result.SetUCharAt(y, x*3+0, b) // B
+			result.SetUCharAt(y, x*3+1, g) // G
+			result.SetUCharAt(y, x*3+2, r) // R
 		}
 	}
 

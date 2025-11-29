@@ -86,20 +86,16 @@ func (s *Inswapper) Swap(targetFace gocv.Mat, sourceEmbedding *Embedding) (gocv.
 }
 
 // preprocessTarget converts target face to model input format
+// Matches insightface preprocessing:
+// blob = cv2.dnn.blobFromImage(aimg, 1.0/255, input_size, (0,0,0), swapRB=True)
 func (s *Inswapper) preprocessTarget(img gocv.Mat) []float32 {
-	// Convert BGR to RGB
-	rgb := gocv.NewMat()
-	gocv.CvtColor(img, &rgb, gocv.ColorBGRToRGB)
-	defer rgb.Close()
-
-	// Convert to float and normalize to [0, 1]
-	floatImg := gocv.NewMat()
-	rgb.ConvertTo(&floatImg, gocv.MatTypeCV32FC3)
-	defer floatImg.Close()
-
-	// Create blob (HWC to NCHW)
-	blob := gocv.BlobFromImage(floatImg, 1.0/255.0, image.Pt(128, 128),
-		gocv.NewScalar(0, 0, 0, 0), false, false)
+	// BlobFromImage with:
+	// - scalefactor = 1/255 for [0, 1] normalization
+	// - swapRB = true to convert BGR (OpenCV) to RGB (model expects RGB)
+	// - mean = (0, 0, 0)
+	// - crop = false
+	blob := gocv.BlobFromImage(img, 1.0/255.0, image.Pt(128, 128),
+		gocv.NewScalar(0, 0, 0, 0), true, false)
 	defer blob.Close()
 
 	// Extract data

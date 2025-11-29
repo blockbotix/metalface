@@ -144,27 +144,59 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 	// Determine face size based on input
 	faceSize := swappedFace.Rows() // 128 for inswapper, 512 for simswap
 
+	// For 128x128 faces (inswapper), apply slight blur then pre-upscale to 256x256
+	// The blur smooths out the 128x128 pixels before upscaling (like Python does)
+	faceToWarp := swappedFace
+	upscaledFace := gocv.NewMat()
+	upscaledMaskSize := faceSize
+	if faceSize == 128 {
+		// Apply subtle 3x3 Gaussian blur to smooth pixels before upscaling
+		blurredFace := gocv.NewMat()
+		gocv.GaussianBlur(swappedFace, &blurredFace, image.Pt(3, 3), 0.5, 0.5, gocv.BorderDefault)
+		gocv.Resize(blurredFace, &upscaledFace, image.Pt(256, 256), 0, 0, gocv.InterpolationLanczos4)
+		blurredFace.Close()
+		faceToWarp = upscaledFace
+		upscaledMaskSize = 256
+	}
+	defer upscaledFace.Close()
+
 	// Inverse warp the swapped face to original frame coordinates
 	invTransform := gocv.NewMat()
 	gocv.InvertAffineTransform(transform, &invTransform)
 	defer invTransform.Close()
 
+	// Scale the inverse transform to account for pre-upscaling
+	// The transform was computed for 128x128, but we're now using 256x256
+	scaledInvTransform := invTransform.Clone()
+	defer scaledInvTransform.Close()
+	if faceSize == 128 {
+		// Scale transform: multiply the translation and scale components by 0.5
+		// because we upscaled the source by 2x
+		scaledInvTransform.SetDoubleAt(0, 0, invTransform.GetDoubleAt(0, 0)*0.5)
+		scaledInvTransform.SetDoubleAt(0, 1, invTransform.GetDoubleAt(0, 1)*0.5)
+		scaledInvTransform.SetDoubleAt(1, 0, invTransform.GetDoubleAt(1, 0)*0.5)
+		scaledInvTransform.SetDoubleAt(1, 1, invTransform.GetDoubleAt(1, 1)*0.5)
+		// Translation stays the same
+	}
+
 	frameSize := image.Pt(frame.Cols(), frame.Rows())
 
+	// Use Lanczos4 interpolation for high quality warping
 	warpedFace := gocv.NewMat()
-	gocv.WarpAffine(swappedFace, &warpedFace, invTransform, frameSize)
+	gocv.WarpAffineWithParams(faceToWarp, &warpedFace, scaledInvTransform, frameSize,
+		gocv.InterpolationLanczos4, gocv.BorderConstant, color.RGBA{0, 0, 0, 0})
 	defer warpedFace.Close()
 
 	// Create full white mask on the aligned face BEFORE warping
 	// (insightface style: img_white = np.full((aimg.shape[0],aimg.shape[1]), 255))
-	smallMask := gocv.NewMatWithSize(faceSize, faceSize, gocv.MatTypeCV8U)
+	smallMask := gocv.NewMatWithSize(upscaledMaskSize, upscaledMaskSize, gocv.MatTypeCV8U)
 	smallMask.SetTo(gocv.NewScalar(255, 0, 0, 0))
 	defer smallMask.Close()
 
-	// Warp the mask using the same inverse transform
+	// Warp the mask using the same scaled inverse transform
 	warpedMask := gocv.NewMat()
 	defer warpedMask.Close()
-	gocv.WarpAffine(smallMask, &warpedMask, invTransform, frameSize)
+	gocv.WarpAffine(smallMask, &warpedMask, scaledInvTransform, frameSize)
 
 	// Threshold to clean up interpolation artifacts (insightface: img_white[img_white>20] = 255)
 	gocv.Threshold(warpedMask, &warpedMask, 20, 255, gocv.ThresholdBinary)

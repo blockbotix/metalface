@@ -101,40 +101,63 @@ def convert_onnx_to_coreml(onnx_path: Path) -> tuple[bool, str]:
         return False, f"Failed: {str(e)[:300]}"
 
 
+def convert_gfpgan_onnx_to_coreml(onnx_path: Path) -> tuple[bool, str]:
+    """
+    Convert GFPGAN ONNX model to Core ML.
+    GFPGAN expects 512x512 input normalized to [-1,1], outputs [-1,1].
+    """
+    output_path = OUTPUT_DIR / f"{onnx_path.stem}.mlpackage"
+
+    try:
+        print(f"  Loading GFPGAN ONNX model...")
+        onnx_model = onnx.load(str(onnx_path))
+
+        print(f"  Converting ONNX to PyTorch...")
+        torch_model = onnx2torch_convert(onnx_model)
+        torch_model.eval()
+
+        # GFPGAN expects 512x512 input
+        example_input = torch.randn(1, 3, 512, 512)
+
+        print(f"  Tracing PyTorch model...")
+        traced_model = torch.jit.trace(torch_model, example_input)
+
+        print(f"  Converting to Core ML...")
+        ct_inputs = [ct.TensorType(name="input", shape=(1, 3, 512, 512))]
+
+        mlmodel = ct.convert(
+            traced_model,
+            inputs=ct_inputs,
+            minimum_deployment_target=ct.target.macOS13,
+            convert_to="mlprogram",
+        )
+
+        print(f"  Saving to {output_path}...")
+        mlmodel.save(str(output_path))
+
+        return True, f"Successfully converted to {output_path.name}"
+
+    except Exception as e:
+        import traceback
+        return False, f"Failed: {str(e)[:300]}"
+
+
 def convert_pytorch_gfpgan(pth_path: Path) -> tuple[bool, str]:
     """
     Convert GFPGAN PyTorch model to Core ML.
     GFPGAN requires the model architecture to be defined.
     """
-    output_path = OUTPUT_DIR / f"{pth_path.stem}.mlpackage"
+    # If ONNX version exists, use that instead
+    onnx_path = pth_path.parent / f"{pth_path.stem}.onnx"
+    if onnx_path.exists():
+        return convert_gfpgan_onnx_to_coreml(onnx_path)
 
-    try:
-        print(f"  Loading PyTorch checkpoint...")
-        checkpoint = torch.load(str(pth_path), map_location='cpu', weights_only=False)
+    # Also check for _1.4 version
+    onnx_path_v14 = pth_path.parent / "gfpgan_1.4.onnx"
+    if onnx_path_v14.exists():
+        return convert_gfpgan_onnx_to_coreml(onnx_path_v14)
 
-        # Check what's in the checkpoint
-        if isinstance(checkpoint, dict):
-            keys = list(checkpoint.keys())[:10]
-            print(f"  Checkpoint keys: {keys}...")
-
-            # GFPGAN typically stores state_dict under various keys
-            if 'params_ema' in checkpoint:
-                state_dict = checkpoint['params_ema']
-            elif 'params' in checkpoint:
-                state_dict = checkpoint['params']
-            elif 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            else:
-                state_dict = checkpoint
-        else:
-            state_dict = checkpoint
-
-        # GFPGAN is a complex GAN architecture - we need the full model definition
-        # which is not included in the .pth file
-        return False, "GFPGAN requires model architecture code (not included in .pth). Need gfpgan package installed with model definition."
-
-    except Exception as e:
-        return False, f"Failed: {str(e)[:200]}"
+    return False, "GFPGAN .pth requires model architecture code. Convert to ONNX first using scripts/convert_gfpgan.py"
 
 
 def main():
@@ -161,7 +184,10 @@ def main():
         print("-" * 50)
 
         if model_path.suffix == '.onnx':
-            success, message = convert_onnx_to_coreml(model_path)
+            if 'gfpgan' in model_path.name.lower():
+                success, message = convert_gfpgan_onnx_to_coreml(model_path)
+            else:
+                success, message = convert_onnx_to_coreml(model_path)
         elif model_path.suffix in ['.pt', '.pth']:
             if 'gfpgan' in model_path.name.lower():
                 success, message = convert_pytorch_gfpgan(model_path)
