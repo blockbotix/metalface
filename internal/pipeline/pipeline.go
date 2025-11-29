@@ -25,6 +25,8 @@ type Config struct {
 	SimSwap512ModelPath string // Path to SimSwap 512 model
 	EmapPath            string // Path to emap.bin for inswapper embedding transformation
 	GFPGANModelPath     string
+	GPEN256ModelPath    string // Path to GPEN-BFR-256 model (fast)
+	GPEN512ModelPath    string // Path to GPEN-BFR-512 model (balanced)
 	SourceImagePath     string
 	DetectionSize       int
 	ConfThreshold       float32
@@ -32,10 +34,10 @@ type Config struct {
 	BlurSize            int
 	EnableMouthMask     bool
 	EnableColorTransfer bool
-	EnableEnhancer      bool
 	Sharpness           float32
-	Backend             Backend   // "onnx" or "coreml"
-	Model               ModelType // "inswapper" or "simswap512"
+	Backend             Backend      // "onnx" or "coreml"
+	Model               ModelType    // "inswapper" or "simswap512"
+	Enhancer            EnhancerType // "gfpgan", "gpen256", "gpen512", or "" for none
 }
 
 // Timing holds performance timing information
@@ -57,7 +59,7 @@ type Pipeline struct {
 	generator       FaceSwapper
 	aligner         *swapper.FaceAligner
 	blender         *swapper.Blender
-	enhancer        *enhancer.GFPGAN
+	enhancer        FaceEnhancer
 	emap            *swapper.Emap // Expression map for embedding transformation
 	sourceEmbedding *swapper.Embedding
 	lastTiming      Timing
@@ -103,6 +105,15 @@ func New(config Config) (*Pipeline, error) {
 			return nil, fmt.Errorf("failed to initialize CoreML: %w", err)
 		}
 		fmt.Println("  CoreML initialized")
+
+		// Also initialize ONNX Runtime if enhancer is enabled (all enhancers use ONNX)
+		if config.Enhancer != EnhancerNone {
+			fmt.Println("  Initializing ONNX Runtime (for face enhancer)...")
+			if err := inference.Initialize(); err != nil {
+				return nil, fmt.Errorf("failed to initialize ONNX Runtime: %w", err)
+			}
+			fmt.Println("  ONNX Runtime initialized")
+		}
 
 		// Create CoreML detector
 		fmt.Println("  Loading SCRFD detector (CoreML)...")
@@ -233,21 +244,57 @@ func New(config Config) (*Pipeline, error) {
 	aligner := swapper.NewFaceAligner()
 	blender := swapper.NewBlender(config.BlurSize)
 
-	// Create GFPGAN enhancer if enabled (ONNX only for now)
-	var enh *enhancer.GFPGAN
-	if config.EnableEnhancer && config.GFPGANModelPath != "" && backend == BackendONNX {
-		fmt.Println("  Loading GFPGAN enhancer...")
-		enh, err = enhancer.NewGFPGAN(config.GFPGANModelPath)
-		if err != nil {
-			faceDet.Close()
-			if landmarkDet != nil {
-				landmarkDet.Close()
+	// Create face enhancer if enabled
+	// Note: All enhancers use ONNX - CoreML conversion fails for these models
+	var enh FaceEnhancer
+	if config.Enhancer != EnhancerNone {
+		switch config.Enhancer {
+		case EnhancerGPEN256:
+			if config.GPEN256ModelPath != "" {
+				fmt.Println("  Loading GPEN-256 enhancer (fast)...")
+				enh, err = enhancer.NewGPEN(config.GPEN256ModelPath, enhancer.GPEN256)
+				if err != nil {
+					faceDet.Close()
+					if landmarkDet != nil {
+						landmarkDet.Close()
+					}
+					enc.Close()
+					gen.Close()
+					return nil, fmt.Errorf("failed to create GPEN-256 enhancer: %w", err)
+				}
+				fmt.Println("  GPEN-256 enhancer loaded")
 			}
-			enc.Close()
-			gen.Close()
-			return nil, fmt.Errorf("failed to create enhancer: %w", err)
+		case EnhancerGPEN512:
+			if config.GPEN512ModelPath != "" {
+				fmt.Println("  Loading GPEN-512 enhancer (balanced)...")
+				enh, err = enhancer.NewGPEN(config.GPEN512ModelPath, enhancer.GPEN512)
+				if err != nil {
+					faceDet.Close()
+					if landmarkDet != nil {
+						landmarkDet.Close()
+					}
+					enc.Close()
+					gen.Close()
+					return nil, fmt.Errorf("failed to create GPEN-512 enhancer: %w", err)
+				}
+				fmt.Println("  GPEN-512 enhancer loaded")
+			}
+		case EnhancerGFPGAN:
+			if config.GFPGANModelPath != "" {
+				fmt.Println("  Loading GFPGAN enhancer (high quality, slow)...")
+				enh, err = enhancer.NewGFPGAN(config.GFPGANModelPath)
+				if err != nil {
+					faceDet.Close()
+					if landmarkDet != nil {
+						landmarkDet.Close()
+					}
+					enc.Close()
+					gen.Close()
+					return nil, fmt.Errorf("failed to create GFPGAN enhancer: %w", err)
+				}
+				fmt.Println("  GFPGAN enhancer loaded")
+			}
 		}
-		fmt.Println("  GFPGAN enhancer loaded")
 	}
 
 	// Load emap for embedding transformation
@@ -474,9 +521,9 @@ func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 		if p.enhancer != nil {
 			enhanced, err := p.enhancer.Enhance(swappedFace)
 			if err == nil {
-				// Resize enhanced face back to original swap size
+				// Resize enhanced face back to original swap size using high-quality interpolation
 				resized := gocv.NewMat()
-				gocv.Resize(enhanced, &resized, image.Pt(faceSize, faceSize), 0, 0, gocv.InterpolationLinear)
+				gocv.Resize(enhanced, &resized, image.Pt(faceSize, faceSize), 0, 0, gocv.InterpolationLanczos4)
 				enhanced.Close()
 				swappedFace.Close()
 				faceToBlend = resized

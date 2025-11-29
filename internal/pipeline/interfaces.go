@@ -23,6 +23,16 @@ const (
 	ModelSimSwap512 ModelType = "simswap512"
 )
 
+// EnhancerType represents the face enhancement model to use
+type EnhancerType string
+
+const (
+	EnhancerNone    EnhancerType = ""
+	EnhancerGFPGAN  EnhancerType = "gfpgan"
+	EnhancerGPEN256 EnhancerType = "gpen256"
+	EnhancerGPEN512 EnhancerType = "gpen512"
+)
+
 // FaceDetector interface for face detection
 type FaceDetector interface {
 	Detect(img gocv.Mat) ([]detector.Face, error)
@@ -44,5 +54,11 @@ type FaceEncoder interface {
 // FaceSwapper interface for face swapping
 type FaceSwapper interface {
 	Swap(targetFace gocv.Mat, sourceEmbedding *swapper.Embedding) (gocv.Mat, error)
+	Close() error
+}
+
+// FaceEnhancer interface for face enhancement/restoration
+type FaceEnhancer interface {
+	Enhance(face gocv.Mat) (gocv.Mat, error)
 	Close() error
 }

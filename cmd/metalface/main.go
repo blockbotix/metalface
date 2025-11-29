@@ -26,7 +26,7 @@ func init() {
 type Config struct {
 	SourceImage string
 	CameraIndex int
-	Enhance     bool
+	Enhancer    string // "gpen256", "gpen512", "gfpgan", or "" for none
 	VirtualCam  bool
 	Preview     bool
 	TargetFPS   int
@@ -56,8 +56,8 @@ func parseFlags() Config {
 	flag.StringVar(&config.SourceImage, "s", "", "Source face image (shorthand)")
 	flag.IntVar(&config.CameraIndex, "camera", 0, "Camera device index")
 	flag.IntVar(&config.CameraIndex, "c", 0, "Camera device index (shorthand)")
-	flag.BoolVar(&config.Enhance, "enhance", false, "Enable face enhancement")
-	flag.BoolVar(&config.Enhance, "e", false, "Enable face enhancement (shorthand)")
+	flag.StringVar(&config.Enhancer, "enhance", "", "Face enhancer: gpen256 (fast), gpen512 (balanced), gfpgan (slow)")
+	flag.StringVar(&config.Enhancer, "e", "", "Face enhancer (shorthand)")
 	flag.BoolVar(&config.VirtualCam, "vcam", false, "Output to virtual camera")
 	flag.BoolVar(&config.VirtualCam, "v", false, "Output to virtual camera (shorthand)")
 	flag.BoolVar(&config.Preview, "preview", true, "Show preview window")
@@ -112,7 +112,8 @@ func run(config Config) error {
 		arcfacePath = "converted_coreml/arcface.mlpackage"
 		inswapperPath = "converted_coreml/inswapper.mlpackage"
 		simswap512Path = "" // SimSwap512 not yet converted to CoreML
-		gfpganPath = ""     // GFPGAN not yet converted to CoreML
+		// GFPGAN CoreML conversion fails due to unsupported ops - use ONNX fallback
+		gfpganPath = "models/gfpgan_1.4.onnx"
 	} else {
 		scrfdPath = "models/scrfd_10g.onnx"
 		landmark106Path = "models/2d106det.onnx"
@@ -120,6 +121,21 @@ func run(config Config) error {
 		inswapperPath = "models/inswapper.onnx"
 		simswap512Path = "models/simswap_512_unofficial.onnx"
 		gfpganPath = "models/gfpgan_1.4.onnx"
+	}
+
+	// Validate and convert enhancer type
+	var enhancerType pipeline.EnhancerType
+	switch config.Enhancer {
+	case "gpen256":
+		enhancerType = pipeline.EnhancerGPEN256
+	case "gpen512":
+		enhancerType = pipeline.EnhancerGPEN512
+	case "gfpgan":
+		enhancerType = pipeline.EnhancerGFPGAN
+	case "":
+		enhancerType = pipeline.EnhancerNone
+	default:
+		return fmt.Errorf("invalid enhancer: %s (use gpen256, gpen512, or gfpgan)", config.Enhancer)
 	}
 
 	// Create pipeline config
@@ -131,17 +147,19 @@ func run(config Config) error {
 		SimSwap512ModelPath: simswap512Path,
 		EmapPath:            "models/emap.bin", // Expression map for inswapper embedding transformation
 		GFPGANModelPath:     gfpganPath,
+		GPEN256ModelPath:    "models/gpen_bfr_256.onnx",
+		GPEN512ModelPath:    "models/gpen_bfr_512.onnx",
 		SourceImagePath:     config.SourceImage,
 		DetectionSize:       640,
 		ConfThreshold:       0.5,
 		NMSThreshold:        0.4,
 		BlurSize:            31, // Increased for better feathering (like Deep-Live-Cam)
 		EnableMouthMask:     false,
-		EnableColorTransfer: true,                                                 // Enable LAB color transfer
-		EnableEnhancer:      config.Enhance && backend != pipeline.BackendCoreML,  // GFPGAN only on ONNX for now
-		Sharpness:           0,                                                    // Disable for now, can cause artifacts
+		EnableColorTransfer: true, // Enable LAB color transfer
+		Sharpness:           0,    // Disable for now, can cause artifacts
 		Backend:             backend,
 		Model:               model,
+		Enhancer:            enhancerType,
 	}
 
 	// Initialize pipeline

@@ -52,13 +52,15 @@ func (g *GFPGAN) Enhance(face gocv.Mat) (gocv.Mat, error) {
 	gocv.CvtColor(resized, &rgb, gocv.ColorBGRToRGB)
 	defer rgb.Close()
 
-	// Convert to float32 and normalize to [0, 1]
+	// Convert to float32
 	floatMat := gocv.NewMat()
 	rgb.ConvertTo(&floatMat, gocv.MatTypeCV32FC3)
 	defer floatMat.Close()
 
-	// Normalize: divide by 255 to get [0, 1]
-	floatMat.DivideFloat(255.0)
+	// Normalize to [-1, 1] range (GFPGAN expects this)
+	// Formula: (pixel / 255.0 - 0.5) / 0.5 = pixel / 127.5 - 1.0
+	floatMat.DivideFloat(127.5)
+	floatMat.SubtractFloat(1.0)
 
 	// Create NCHW blob (1, 3, 512, 512)
 	blob := gocv.BlobFromImage(floatMat, 1.0, image.Pt(gfpganInputSize, gfpganInputSize),
@@ -103,8 +105,9 @@ func (g *GFPGAN) Enhance(face gocv.Mat) (gocv.Mat, error) {
 
 // postprocess converts model output to BGR image
 func (g *GFPGAN) postprocess(output []float32) gocv.Mat {
-	// Output is in NCHW format, values in [-1, 1] or [0, 1]
+	// Output is in NCHW format, values in [-1, 1]
 	// Need to convert to HWC BGR uint8
+	// Denormalization: pixel = (value + 1) * 127.5
 
 	size := gfpganInputSize * gfpganInputSize
 	pixels := make([]byte, size*3)
@@ -118,18 +121,22 @@ func (g *GFPGAN) postprocess(output []float32) gocv.Mat {
 			g := output[1*size+idx]
 			b := output[2*size+idx]
 
-			// Clamp to [0, 1] and convert to uint8
-			// Output may be in [-1, 1] or [0, 1] depending on model
-			// Try [0, 1] first
-			r = clamp(r, 0, 1)
-			g = clamp(g, 0, 1)
-			b = clamp(b, 0, 1)
+			// Denormalize from [-1, 1] to [0, 255]
+			// Formula: (value + 1) * 127.5
+			r = (r + 1) * 127.5
+			g = (g + 1) * 127.5
+			b = (b + 1) * 127.5
+
+			// Clamp to [0, 255]
+			r = clamp(r, 0, 255)
+			g = clamp(g, 0, 255)
+			b = clamp(b, 0, 255)
 
 			pixIdx := (y*gfpganInputSize + x) * 3
 			// BGR order for OpenCV
-			pixels[pixIdx+0] = uint8(b * 255)
-			pixels[pixIdx+1] = uint8(g * 255)
-			pixels[pixIdx+2] = uint8(r * 255)
+			pixels[pixIdx+0] = uint8(b)
+			pixels[pixIdx+1] = uint8(g)
+			pixels[pixIdx+2] = uint8(r)
 		}
 	}
 
