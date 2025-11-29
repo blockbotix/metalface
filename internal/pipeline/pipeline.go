@@ -3,6 +3,8 @@ package pipeline
 import (
 	"fmt"
 	"image"
+	"image/color"
+	"os"
 	"time"
 
 	"gocv.io/x/gocv"
@@ -20,6 +22,8 @@ type Config struct {
 	Landmark106Path     string
 	ArcFaceModelPath    string
 	InswapperModelPath  string
+	SimSwap512ModelPath string // Path to SimSwap 512 model
+	EmapPath            string // Path to emap.bin for inswapper embedding transformation
 	GFPGANModelPath     string
 	SourceImagePath     string
 	DetectionSize       int
@@ -30,7 +34,8 @@ type Config struct {
 	EnableColorTransfer bool
 	EnableEnhancer      bool
 	Sharpness           float32
-	Backend             Backend // "onnx" or "coreml"
+	Backend             Backend   // "onnx" or "coreml"
+	Model               ModelType // "inswapper" or "simswap512"
 }
 
 // Timing holds performance timing information
@@ -53,15 +58,19 @@ type Pipeline struct {
 	aligner         *swapper.FaceAligner
 	blender         *swapper.Blender
 	enhancer        *enhancer.GFPGAN
+	emap            *swapper.Emap // Expression map for embedding transformation
 	sourceEmbedding *swapper.Embedding
 	lastTiming      Timing
 	backend         Backend
+	modelType       ModelType
 	// Parallel detection
 	lastFaces  []detector.Face
 	detectChan chan detectResult
 	detecting  bool
 	// Frame interpolation for temporal smoothness
 	previousFrame *gocv.Mat
+	// Debug overlay
+	debugLandmarks bool
 }
 
 type detectResult struct {
@@ -77,6 +86,7 @@ func New(config Config) (*Pipeline, error) {
 		landmarkDet LandmarkDetector
 		enc         FaceEncoder
 		gen         FaceSwapper
+		debugLM     = os.Getenv("METALFACE_DEBUG_LANDMARKS") == "1"
 		err         error
 	)
 
@@ -186,18 +196,37 @@ func New(config Config) (*Pipeline, error) {
 		}
 		fmt.Println("  ArcFace encoder loaded")
 
-		// Create generator
-		fmt.Println("  Loading Inswapper generator...")
-		gen, err = swapper.NewInswapper(config.InswapperModelPath)
-		if err != nil {
-			faceDet.Close()
-			if landmarkDet != nil {
-				landmarkDet.Close()
-			}
-			enc.Close()
-			return nil, fmt.Errorf("failed to create generator: %w", err)
+		// Create generator based on model type
+		modelType := config.Model
+		if modelType == "" {
+			modelType = ModelInswapper // Default to inswapper
 		}
-		fmt.Println("  Inswapper generator loaded")
+
+		if modelType == ModelSimSwap512 {
+			fmt.Println("  Loading SimSwap 512 generator...")
+			gen, err = swapper.NewSimSwap512(config.SimSwap512ModelPath)
+			if err != nil {
+				faceDet.Close()
+				if landmarkDet != nil {
+					landmarkDet.Close()
+				}
+				enc.Close()
+				return nil, fmt.Errorf("failed to create generator: %w", err)
+			}
+			fmt.Println("  SimSwap 512 generator loaded")
+		} else {
+			fmt.Println("  Loading Inswapper generator...")
+			gen, err = swapper.NewInswapper(config.InswapperModelPath)
+			if err != nil {
+				faceDet.Close()
+				if landmarkDet != nil {
+					landmarkDet.Close()
+				}
+				enc.Close()
+				return nil, fmt.Errorf("failed to create generator: %w", err)
+			}
+			fmt.Println("  Inswapper generator loaded")
+		}
 	}
 
 	// Create aligner and blender
@@ -221,17 +250,43 @@ func New(config Config) (*Pipeline, error) {
 		fmt.Println("  GFPGAN enhancer loaded")
 	}
 
+	// Load emap for embedding transformation
+	var emap *swapper.Emap
+	if config.EmapPath != "" {
+		fmt.Println("  Loading emap...")
+		emap, err = swapper.LoadEmap(config.EmapPath)
+		if err != nil {
+			faceDet.Close()
+			if landmarkDet != nil {
+				landmarkDet.Close()
+			}
+			enc.Close()
+			gen.Close()
+			return nil, fmt.Errorf("failed to load emap: %w", err)
+		}
+		fmt.Println("  Emap loaded (512x512 transformation matrix)")
+	}
+
+	// Determine model type
+	modelType := config.Model
+	if modelType == "" {
+		modelType = ModelInswapper
+	}
+
 	p := &Pipeline{
-		config:       config,
-		faceDetector: faceDet,
-		landmarkDet:  landmarkDet,
-		encoder:      enc,
-		generator:    gen,
-		aligner:      aligner,
-		blender:      blender,
-		enhancer:     enh,
-		backend:      backend,
-		detectChan:   make(chan detectResult, 1),
+		config:         config,
+		faceDetector:   faceDet,
+		landmarkDet:    landmarkDet,
+		encoder:        enc,
+		generator:      gen,
+		aligner:        aligner,
+		blender:        blender,
+		enhancer:       enh,
+		emap:           emap,
+		backend:        backend,
+		modelType:      modelType,
+		detectChan:     make(chan detectResult, 1),
+		debugLandmarks: debugLM,
 	}
 
 	// Load source face
@@ -280,8 +335,39 @@ func (p *Pipeline) loadSourceFace(imagePath string) error {
 		return fmt.Errorf("embedding extraction failed: %w", err)
 	}
 
+	// Apply emap transformation only for inswapper model
+	// This transforms ArcFace embedding to inswapper latent space
+	// SimSwap uses raw ArcFace embedding directly
+	if p.emap != nil && p.modelType == ModelInswapper {
+		embedding = p.emap.TransformEmbedding(embedding)
+	}
+
 	p.sourceEmbedding = embedding
 	return nil
+}
+
+// drawDebugLandmarks overlays 5-point (and optionally 106) landmarks for visual inspection
+func (p *Pipeline) drawDebugLandmarks(frame *gocv.Mat, lm detector.Landmarks, lm106 *detector.Landmarks106) {
+	// 5-point in distinct colors
+	colors := []color.RGBA{
+		{255, 0, 0, 0},   // left eye
+		{0, 255, 0, 0},   // right eye
+		{0, 0, 255, 0},   // nose
+		{255, 255, 0, 0}, // left mouth
+		{0, 255, 255, 0}, // right mouth
+	}
+	pts := []detector.Point{lm.LeftEye, lm.RightEye, lm.Nose, lm.LeftMouth, lm.RightMouth}
+	for i, pt := range pts {
+		gocv.Circle(frame, image.Pt(int(pt.X), int(pt.Y)), 3, colors[i], 2)
+	}
+
+	// Optional: light gray dots for 106 landmarks to see spread / bbox
+	if lm106 != nil {
+		gray := color.RGBA{200, 200, 200, 0}
+		for i := 0; i < len(*lm106); i++ {
+			gocv.Circle(frame, image.Pt(int((*lm106)[i].X), int((*lm106)[i].Y)), 1, gray, 1)
+		}
+	}
 }
 
 // Process performs face swap on a frame - parallel detection, sync swap
@@ -319,20 +405,12 @@ func (p *Pipeline) Process(frame *gocv.Mat) error {
 		p.processSwap(frame, p.lastFaces)
 		timing.Swap = time.Since(swapStart)
 
-		// Frame interpolation: blend with previous frame for temporal smoothness
-		// This reduces flicker (like Deep-Live-Cam's 20% interpolation)
-		if p.previousFrame != nil && !p.previousFrame.Empty() {
-			// Blend: 80% current + 20% previous
-			gocv.AddWeighted(*frame, 0.8, *p.previousFrame, 0.2, 0, frame)
-		}
-
-		// Store current frame for next iteration
-		if p.previousFrame == nil {
-			prevFrame := frame.Clone()
-			p.previousFrame = &prevFrame
-		} else {
-			frame.CopyTo(p.previousFrame)
-		}
+		// Frame interpolation disabled for better lip sync responsiveness
+		// The 80/20 blend was causing noticeable lag in mouth movements
+		// TODO: Consider making this configurable if users want smoother output
+		// if p.previousFrame != nil && !p.previousFrame.Empty() {
+		// 	gocv.AddWeighted(*frame, 0.95, *p.previousFrame, 0.05, 0, frame)
+		// }
 	}
 
 	timing.Total = time.Since(totalStart)
@@ -352,7 +430,34 @@ func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 			}
 		}
 
-		aligned, err := p.aligner.AlignForInswapper(*frame, face.Landmarks)
+		// Hybrid approach: use SCRFD eyes (stable ordering) + 106-point mouth/nose (fresh for lip sync)
+		// SCRFD 5-point has guaranteed correct left/right ordering from model training
+		// 106-point mouth positions are fresh (from current frame) for better lip sync
+		landmarks := face.Landmarks // SCRFD 5-point (correctly ordered)
+		if face.Landmarks106 != nil {
+			fresh := face.Landmarks106.GetFivePoint()
+			// Only update mouth and nose from fresh 106-point
+			// Keep SCRFD eye positions for stable alignment during head tilts
+			landmarks.LeftMouth = fresh.LeftMouth
+			landmarks.RightMouth = fresh.RightMouth
+			landmarks.Nose = fresh.Nose
+		}
+		if p.debugLandmarks {
+			p.drawDebugLandmarks(frame, landmarks, face.Landmarks106)
+		}
+
+		// Align face based on model type
+		var aligned *swapper.AlignResult
+		var err error
+		var faceSize int
+
+		if p.modelType == ModelSimSwap512 {
+			aligned, err = p.aligner.AlignForSimSwap512(*frame, landmarks)
+			faceSize = 512
+		} else {
+			aligned, err = p.aligner.AlignForInswapper(*frame, landmarks)
+			faceSize = 128
+		}
 		if err != nil {
 			continue
 		}
@@ -369,9 +474,9 @@ func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 		if p.enhancer != nil {
 			enhanced, err := p.enhancer.Enhance(swappedFace)
 			if err == nil {
-				// Resize enhanced face back to 128x128 (original swap size)
+				// Resize enhanced face back to original swap size
 				resized := gocv.NewMat()
-				gocv.Resize(enhanced, &resized, image.Pt(128, 128), 0, 0, gocv.InterpolationLinear)
+				gocv.Resize(enhanced, &resized, image.Pt(faceSize, faceSize), 0, 0, gocv.InterpolationLinear)
 				enhanced.Close()
 				swappedFace.Close()
 				faceToBlend = resized

@@ -15,6 +15,14 @@ const (
 	BackendCoreML Backend = "coreml"
 )
 
+// ModelType represents the face swap model to use
+type ModelType string
+
+const (
+	ModelInswapper  ModelType = "inswapper"
+	ModelSimSwap512 ModelType = "simswap512"
+)
+
 // FaceDetector interface for face detection
 type FaceDetector interface {
 	Detect(img gocv.Mat) ([]detector.Face, error)

@@ -137,16 +137,25 @@ int coreml_run_inference(
             return -1;
         }
 
-        // Copy output data using getBytesWithHandler to ensure CPU sync
+        // Copy output - must use subscript access for proper GPU->CPU sync
         size_t copySize = MIN(output_size, (size_t)outputArray.count);
-        NSArray<NSNumber*>* strides = outputArray.strides;
-        if (strides.count > 0) {
-            [outputArray getBytesWithHandler:^(const void * _Nonnull bytes, NSInteger size) {
-                memcpy(output_data, bytes, MIN(copySize * sizeof(float), (size_t)size));
-            }];
+        NSArray<NSNumber*>* shape = outputArray.shape;
+        NSInteger numDims = shape.count;
+
+        if (numDims == 2) {
+            // 2D array (N, C) - embeddings like ArcFace
+            NSInteger dim0 = [shape[0] integerValue];
+            NSInteger dim1 = [shape[1] integerValue];
+            size_t outIdx = 0;
+            for (NSInteger i0 = 0; i0 < dim0 && outIdx < copySize; i0++) {
+                for (NSInteger i1 = 0; i1 < dim1 && outIdx < copySize; i1++) {
+                    output_data[outIdx++] = [outputArray[@[@(i0), @(i1)]] floatValue];
+                }
+            }
         } else {
-            float* outputPtr = (float*)outputArray.dataPointer;
-            memcpy(output_data, outputPtr, copySize * sizeof(float));
+            for (size_t j = 0; j < copySize; j++) {
+                output_data[j] = [[outputArray objectAtIndexedSubscript:j] floatValue];
+            }
         }
 
         return 0;
@@ -229,16 +238,40 @@ int coreml_run_inference_multi(
             return -1;
         }
 
-        // Copy output data using getBytesWithHandler to ensure CPU sync
+        // Copy output - must use subscript access for proper GPU->CPU sync
         size_t copySize = MIN(output_size, (size_t)outputArray.count);
-        NSArray<NSNumber*>* strides = outputArray.strides;
-        if (strides.count > 0) {
-            [outputArray getBytesWithHandler:^(const void * _Nonnull bytes, NSInteger size) {
-                memcpy(output_data, bytes, MIN(copySize * sizeof(float), (size_t)size));
-            }];
+        NSArray<NSNumber*>* shape = outputArray.shape;
+        NSInteger numDims = shape.count;
+
+        if (numDims == 4) {
+            // 4D array (N, C, H, W) - inswapper output
+            NSInteger dim0 = [shape[0] integerValue];
+            NSInteger dim1 = [shape[1] integerValue];
+            NSInteger dim2 = [shape[2] integerValue];
+            NSInteger dim3 = [shape[3] integerValue];
+            size_t outIdx = 0;
+            for (NSInteger i0 = 0; i0 < dim0 && outIdx < copySize; i0++) {
+                for (NSInteger i1 = 0; i1 < dim1 && outIdx < copySize; i1++) {
+                    for (NSInteger i2 = 0; i2 < dim2 && outIdx < copySize; i2++) {
+                        for (NSInteger i3 = 0; i3 < dim3 && outIdx < copySize; i3++) {
+                            output_data[outIdx++] = [outputArray[@[@(i0), @(i1), @(i2), @(i3)]] floatValue];
+                        }
+                    }
+                }
+            }
+        } else if (numDims == 2) {
+            NSInteger dim0 = [shape[0] integerValue];
+            NSInteger dim1 = [shape[1] integerValue];
+            size_t outIdx = 0;
+            for (NSInteger i0 = 0; i0 < dim0 && outIdx < copySize; i0++) {
+                for (NSInteger i1 = 0; i1 < dim1 && outIdx < copySize; i1++) {
+                    output_data[outIdx++] = [outputArray[@[@(i0), @(i1)]] floatValue];
+                }
+            }
         } else {
-            float* outputPtr = (float*)outputArray.dataPointer;
-            memcpy(output_data, outputPtr, copySize * sizeof(float));
+            for (size_t j = 0; j < copySize; j++) {
+                output_data[j] = [[outputArray objectAtIndexedSubscript:j] floatValue];
+            }
         }
 
         return 0;

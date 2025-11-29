@@ -135,10 +135,14 @@ func (b *Blender) softenMask(mask gocv.Mat) gocv.Mat {
 	return blurred
 }
 
-// BlendFaceEnhanced performs enhanced blending using 106-point landmarks
-// Implements techniques from Deep-Live-Cam: color transfer, mouth mask, convex hull mask, sharpening
+// BlendFaceEnhanced performs enhanced blending using insightface-style mask erosion
+// Key insight from insightface: erode mask by ~10% of face size before blurring
+// This exposes more original face at boundaries, improving lip sync
 func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, transform gocv.Mat,
 	face *detector.Face, enableMouthMask, enableColorTransfer bool, sharpness float32) {
+
+	// Determine face size based on input
+	faceSize := swappedFace.Rows() // 128 for inswapper, 512 for simswap
 
 	// Inverse warp the swapped face to original frame coordinates
 	invTransform := gocv.NewMat()
@@ -151,28 +155,54 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 	gocv.WarpAffine(swappedFace, &warpedFace, invTransform, frameSize)
 	defer warpedFace.Close()
 
-	// Create ellipse mask on the 128x128 swapped face BEFORE warping
-	// This avoids warp interpolation artifacts
-	smallMask := gocv.NewMatWithSize(128, 128, gocv.MatTypeCV8U)
-	gocv.Ellipse(&smallMask,
-		image.Pt(64, 64),           // center
-		image.Pt(50, 60),           // axes (slightly smaller than 64 to avoid edges)
-		0, 0, 360,
-		color.RGBA{R: 255, G: 255, B: 255, A: 255},
-		-1,
-	)
+	// Create full white mask on the aligned face BEFORE warping
+	// (insightface style: img_white = np.full((aimg.shape[0],aimg.shape[1]), 255))
+	smallMask := gocv.NewMatWithSize(faceSize, faceSize, gocv.MatTypeCV8U)
+	smallMask.SetTo(gocv.NewScalar(255, 0, 0, 0))
 	defer smallMask.Close()
 
 	// Warp the mask using the same inverse transform
-	finalMask := gocv.NewMat()
-	defer finalMask.Close()
-	gocv.WarpAffine(smallMask, &finalMask, invTransform, frameSize)
+	warpedMask := gocv.NewMat()
+	defer warpedMask.Close()
+	gocv.WarpAffine(smallMask, &warpedMask, invTransform, frameSize)
 
-	// Blur for soft edges
-	gocv.GaussianBlur(finalMask, &finalMask, image.Pt(41, 41), 0, 0, gocv.BorderDefault)
+	// Threshold to clean up interpolation artifacts (insightface: img_white[img_white>20] = 255)
+	gocv.Threshold(warpedMask, &warpedMask, 20, 255, gocv.ThresholdBinary)
+
+	// Calculate mask size for erosion (insightface style)
+	// Find bounding box of mask to determine erosion amount
+	maskPoints := gocv.FindContours(warpedMask, gocv.RetrievalExternal, gocv.ChainApproxSimple)
+	maskSize := faceSize // default
+	if maskPoints.Size() > 0 {
+		rect := gocv.BoundingRect(maskPoints.At(0))
+		maskSize = int(float64(rect.Dx()*rect.Dy()) / float64(rect.Dx()+rect.Dy()) * 2) // approximate sqrt(h*w)
+	}
+	maskPoints.Close()
+
+	// Balanced erosion: ~7% of face size
+	// Original insightface uses ~10% which cuts mouth, 5% shows edges
+	k := maskSize / 14
+	if k < 7 {
+		k = 7
+	}
+	// Make kernel size odd for OpenCV
+	if k%2 == 0 {
+		k++
+	}
+	erodeKernel := gocv.GetStructuringElement(gocv.MorphRect, image.Pt(k, k))
+	defer erodeKernel.Close()
+	gocv.Erode(warpedMask, &warpedMask, erodeKernel)
+
+	// Gaussian blur for soft edges (insightface: blur_size based on mask_size//20)
+	blurK := maskSize / 20
+	if blurK < 5 {
+		blurK = 5
+	}
+	blurSize := 2*blurK + 1 // ensure odd
+	gocv.GaussianBlur(warpedMask, &warpedMask, image.Pt(blurSize, blurSize), 0, 0, gocv.BorderDefault)
 
 	// Use alpha blending
-	b.alphaBlend(&warpedFace, frame, finalMask)
+	b.alphaBlend(&warpedFace, frame, warpedMask)
 
 	// Apply sharpening if enabled (disabled for now - can add artifacts)
 	if sharpness > 0 {

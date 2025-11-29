@@ -31,6 +31,7 @@ type Config struct {
 	Preview     bool
 	TargetFPS   int
 	Backend     string
+	Model       string
 }
 
 func main() {
@@ -64,6 +65,8 @@ func parseFlags() Config {
 	flag.IntVar(&config.TargetFPS, "fps", 30, "Target frames per second")
 	flag.StringVar(&config.Backend, "backend", "onnx", "Inference backend: onnx or coreml")
 	flag.StringVar(&config.Backend, "b", "onnx", "Inference backend (shorthand)")
+	flag.StringVar(&config.Model, "model", "inswapper", "Face swap model: inswapper or simswap512")
+	flag.StringVar(&config.Model, "m", "inswapper", "Face swap model (shorthand)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "MetalFace - Real-time face swapping for Apple Silicon\n\n")
@@ -73,6 +76,7 @@ func parseFlags() Config {
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg\n")
 		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --backend coreml\n")
+		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --model simswap512\n")
 		fmt.Fprintf(os.Stderr, "  metalface --source face.jpg --enhance --vcam\n")
 	}
 
@@ -89,26 +93,43 @@ func run(config Config) error {
 		return fmt.Errorf("invalid backend: %s (use 'onnx' or 'coreml')", config.Backend)
 	}
 
+	// Validate model
+	model := pipeline.ModelType(config.Model)
+	if model != pipeline.ModelInswapper && model != pipeline.ModelSimSwap512 {
+		return fmt.Errorf("invalid model: %s (use 'inswapper' or 'simswap512')", config.Model)
+	}
+
+	// SimSwap512 only works with ONNX backend for now
+	if model == pipeline.ModelSimSwap512 && backend != pipeline.BackendONNX {
+		return fmt.Errorf("simswap512 model only works with onnx backend")
+	}
+
 	// Configure model paths based on backend
-	var scrfdPath, arcfacePath, inswapperPath, gfpganPath string
+	var scrfdPath, arcfacePath, inswapperPath, simswap512Path, gfpganPath, landmark106Path string
 	if backend == pipeline.BackendCoreML {
 		scrfdPath = "converted_coreml/scrfd_10g.mlpackage"
+		landmark106Path = "converted_coreml/2d106det.mlpackage"
 		arcfacePath = "converted_coreml/arcface.mlpackage"
 		inswapperPath = "converted_coreml/inswapper.mlpackage"
-		gfpganPath = "" // GFPGAN not yet converted to CoreML
+		simswap512Path = "" // SimSwap512 not yet converted to CoreML
+		gfpganPath = ""     // GFPGAN not yet converted to CoreML
 	} else {
 		scrfdPath = "models/scrfd_10g.onnx"
+		landmark106Path = "models/2d106det.onnx"
 		arcfacePath = "models/arcface.onnx"
 		inswapperPath = "models/inswapper.onnx"
+		simswap512Path = "models/simswap_512_unofficial.onnx"
 		gfpganPath = "models/gfpgan_1.4.onnx"
 	}
 
 	// Create pipeline config
 	pipelineConfig := pipeline.Config{
 		SCRFDModelPath:      scrfdPath,
-		Landmark106Path:     "", // Disabled - 5-point works better for mask alignment
+		Landmark106Path:     landmark106Path, // Enabled for lip sync - derives fresh 5-point from current frame
 		ArcFaceModelPath:    arcfacePath,
 		InswapperModelPath:  inswapperPath,
+		SimSwap512ModelPath: simswap512Path,
+		EmapPath:            "models/emap.bin", // Expression map for inswapper embedding transformation
 		GFPGANModelPath:     gfpganPath,
 		SourceImagePath:     config.SourceImage,
 		DetectionSize:       640,
@@ -116,14 +137,15 @@ func run(config Config) error {
 		NMSThreshold:        0.4,
 		BlurSize:            31, // Increased for better feathering (like Deep-Live-Cam)
 		EnableMouthMask:     false,
-		EnableColorTransfer: true,                                       // Enable LAB color transfer
-		EnableEnhancer:      config.Enhance && backend != pipeline.BackendCoreML, // GFPGAN only on ONNX for now
-		Sharpness:           0,                                          // Disable for now, can cause artifacts
+		EnableColorTransfer: true,                                                 // Enable LAB color transfer
+		EnableEnhancer:      config.Enhance && backend != pipeline.BackendCoreML,  // GFPGAN only on ONNX for now
+		Sharpness:           0,                                                    // Disable for now, can cause artifacts
 		Backend:             backend,
+		Model:               model,
 	}
 
 	// Initialize pipeline
-	fmt.Printf("Loading models (backend: %s)...\n", backend)
+	fmt.Printf("Loading models (backend: %s, model: %s)...\n", backend, model)
 	p, err := pipeline.New(pipelineConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create pipeline: %w", err)

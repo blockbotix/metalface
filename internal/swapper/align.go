@@ -11,19 +11,21 @@ import (
 
 // ArcFace reference landmarks for 112x112 aligned face
 var arcfaceDst = []detector.Point{
-	{X: 38.2946, Y: 51.6963},  // left eye
-	{X: 73.5318, Y: 51.5014},  // right eye
-	{X: 56.0252, Y: 71.7366},  // nose
-	{X: 41.5493, Y: 92.3655},  // left mouth
-	{X: 70.7299, Y: 92.2041},  // right mouth
+	{X: 38.2946, Y: 51.6963}, // left eye
+	{X: 73.5318, Y: 51.5014}, // right eye
+	{X: 56.0252, Y: 71.7366}, // nose
+	{X: 41.5493, Y: 92.3655}, // left mouth
+	{X: 70.7299, Y: 92.2041}, // right mouth
 }
 
 // FaceAligner handles face alignment transformations
 type FaceAligner struct {
-	arcfaceSize    int
-	inswapperSize  int
-	arcfaceDstMat  gocv.Mat
-	inswapperDstMat gocv.Mat
+	arcfaceSize      int
+	inswapperSize    int
+	simswap512Size   int
+	arcfaceDstMat    gocv.Mat
+	inswapperDstMat  gocv.Mat
+	simswap512DstMat gocv.Mat
 }
 
 // NewFaceAligner creates a new face aligner
@@ -37,18 +39,29 @@ func NewFaceAligner() *FaceAligner {
 
 	// Create destination matrices for Inswapper (128x128)
 	// Scale reference points from 112 to 128
-	scale := float32(128) / float32(112)
+	scale128 := float32(128) / float32(112)
 	inswapperDstMat := gocv.NewMatWithSize(5, 2, gocv.MatTypeCV32F)
 	for i, pt := range arcfaceDst {
-		inswapperDstMat.SetFloatAt(i, 0, pt.X*scale)
-		inswapperDstMat.SetFloatAt(i, 1, pt.Y*scale)
+		inswapperDstMat.SetFloatAt(i, 0, pt.X*scale128)
+		inswapperDstMat.SetFloatAt(i, 1, pt.Y*scale128)
+	}
+
+	// Create destination matrices for SimSwap 512 (512x512)
+	// Scale reference points from 112 to 512
+	scale512 := float32(512) / float32(112)
+	simswap512DstMat := gocv.NewMatWithSize(5, 2, gocv.MatTypeCV32F)
+	for i, pt := range arcfaceDst {
+		simswap512DstMat.SetFloatAt(i, 0, pt.X*scale512)
+		simswap512DstMat.SetFloatAt(i, 1, pt.Y*scale512)
 	}
 
 	return &FaceAligner{
-		arcfaceSize:    112,
-		inswapperSize:  128,
-		arcfaceDstMat:  arcfaceDstMat,
-		inswapperDstMat: inswapperDstMat,
+		arcfaceSize:      112,
+		inswapperSize:    128,
+		simswap512Size:   512,
+		arcfaceDstMat:    arcfaceDstMat,
+		inswapperDstMat:  inswapperDstMat,
+		simswap512DstMat: simswap512DstMat,
 	}
 }
 
@@ -68,6 +81,11 @@ func (a *FaceAligner) AlignForInswapper(img gocv.Mat, landmarks detector.Landmar
 	return a.alignFace(img, landmarks, a.inswapperDstMat, a.inswapperSize)
 }
 
+// AlignForSimSwap512 aligns a face to 512x512 for SimSwap 512
+func (a *FaceAligner) AlignForSimSwap512(img gocv.Mat, landmarks detector.Landmarks) (*AlignResult, error) {
+	return a.alignFace(img, landmarks, a.simswap512DstMat, a.simswap512Size)
+}
+
 // alignFace performs the alignment
 func (a *FaceAligner) alignFace(img gocv.Mat, landmarks detector.Landmarks, dstPts gocv.Mat, size int) (*AlignResult, error) {
 	// Create source points matrix from detected landmarks
@@ -85,7 +103,7 @@ func (a *FaceAligner) alignFace(img gocv.Mat, landmarks detector.Landmarks, dstP
 	srcPts.SetFloatAt(4, 0, landmarks.RightMouth.X)
 	srcPts.SetFloatAt(4, 1, landmarks.RightMouth.Y)
 
-	// Estimate similarity transform
+	// Estimate similarity transform (OpenCV partial affine with similarity constraints)
 	transform := estimateSimilarityTransform(srcPts, dstPts)
 
 	// Warp the image
@@ -116,16 +134,41 @@ func (a *FaceAligner) InverseWarp(face gocv.Mat, transform gocv.Mat, targetSize 
 func (a *FaceAligner) Close() {
 	a.arcfaceDstMat.Close()
 	a.inswapperDstMat.Close()
+	a.simswap512DstMat.Close()
 }
 
 // estimateSimilarityTransform computes a 2D similarity transform (rotation, scale, translation)
-// from source points to destination points
+// from source points to destination points using OpenCV's estimateAffinePartial2D
 func estimateSimilarityTransform(src, dst gocv.Mat) gocv.Mat {
-	// We need to solve for: dst = M * src
-	// where M is a 2x3 matrix [s*cos(θ), -s*sin(θ), tx; s*sin(θ), s*cos(θ), ty]
-	//
-	// Using least squares to find optimal s, θ, tx, ty
+	n := src.Rows()
 
+	// Convert to Point2f slices for OpenCV
+	srcPoints := make([]gocv.Point2f, n)
+	dstPoints := make([]gocv.Point2f, n)
+
+	for i := 0; i < n; i++ {
+		srcPoints[i] = gocv.Point2f{X: src.GetFloatAt(i, 0), Y: src.GetFloatAt(i, 1)}
+		dstPoints[i] = gocv.Point2f{X: dst.GetFloatAt(i, 0), Y: dst.GetFloatAt(i, 1)}
+	}
+
+	srcPtsVec := gocv.NewPoint2fVectorFromPoints(srcPoints)
+	dstPtsVec := gocv.NewPoint2fVectorFromPoints(dstPoints)
+	defer srcPtsVec.Close()
+	defer dstPtsVec.Close()
+
+	// Use OpenCV's estimateAffinePartial2D for robust similarity transform
+	transform := gocv.EstimateAffinePartial2D(srcPtsVec, dstPtsVec)
+
+	// Verify transform is valid
+	if transform.Empty() || transform.Rows() != 2 || transform.Cols() != 3 {
+		return estimateSimilarityTransformManual(src, dst)
+	}
+
+	return transform
+}
+
+// estimateSimilarityTransformManual is the fallback manual implementation
+func estimateSimilarityTransformManual(src, dst gocv.Mat) gocv.Mat {
 	n := src.Rows()
 
 	// Compute centroids
@@ -174,7 +217,6 @@ func estimateSimilarityTransform(src, dst gocv.Mat) gocv.Mat {
 	}
 
 	// SVD-like solution for 2D similarity
-	// cos(θ) ∝ a11 + a22, sin(θ) ∝ a21 - a12
 	norm := math.Sqrt((a11+a22)*(a11+a22) + (a21-a12)*(a21-a12))
 	if norm < 1e-10 {
 		norm = 1
@@ -200,4 +242,17 @@ func estimateSimilarityTransform(src, dst gocv.Mat) gocv.Mat {
 	transform.SetDoubleAt(1, 2, ty)
 
 	return transform
+}
+
+// fixLandmarkOrder ensures landmarks are correctly ordered to prevent eye swapping
+// at extreme head tilts. Uses cross product to determine correct left/right assignment.
+func fixLandmarkOrder(lm detector.Landmarks) detector.Landmarks {
+	// Enforce viewer-space ordering (smaller X = left) to avoid roll-induced swaps.
+	if lm.LeftEye.X > lm.RightEye.X {
+		lm.LeftEye, lm.RightEye = lm.RightEye, lm.LeftEye
+	}
+	if lm.LeftMouth.X > lm.RightMouth.X {
+		lm.LeftMouth, lm.RightMouth = lm.RightMouth, lm.LeftMouth
+	}
+	return lm
 }
