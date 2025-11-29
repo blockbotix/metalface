@@ -142,13 +142,14 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 	face *detector.Face, enableMouthMask, enableColorTransfer bool, sharpness float32) {
 
 	// Determine face size based on input
-	faceSize := swappedFace.Rows() // 128 for inswapper, 512 for simswap
+	// Could be: 128 (raw inswapper), 256 (GPEN-256 enhanced), 512 (GPEN-512/simswap)
+	faceSize := swappedFace.Rows()
 
-	// For 128x128 faces (inswapper), apply slight blur then pre-upscale to 256x256
-	// The blur smooths out the 128x128 pixels before upscaling (like Python does)
+	// For 128x128 faces (raw inswapper without enhancement), apply slight blur then upscale
+	// For enhanced faces (256/512), use directly - they're already high quality
 	faceToWarp := swappedFace
 	upscaledFace := gocv.NewMat()
-	upscaledMaskSize := faceSize
+	workingSize := faceSize // The size we'll work with for warping
 	if faceSize == 128 {
 		// Apply subtle 3x3 Gaussian blur to smooth pixels before upscaling
 		blurredFace := gocv.NewMat()
@@ -156,7 +157,7 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 		gocv.Resize(blurredFace, &upscaledFace, image.Pt(256, 256), 0, 0, gocv.InterpolationLanczos4)
 		blurredFace.Close()
 		faceToWarp = upscaledFace
-		upscaledMaskSize = 256
+		workingSize = 256
 	}
 	defer upscaledFace.Close()
 
@@ -165,17 +166,18 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 	gocv.InvertAffineTransform(transform, &invTransform)
 	defer invTransform.Close()
 
-	// Scale the inverse transform to account for pre-upscaling
-	// The transform was computed for 128x128, but we're now using 256x256
+	// Scale the inverse transform based on the ratio between working size and original 128
+	// The transform was computed for 128x128 alignment
 	scaledInvTransform := invTransform.Clone()
 	defer scaledInvTransform.Close()
-	if faceSize == 128 {
-		// Scale transform: multiply the translation and scale components by 0.5
-		// because we upscaled the source by 2x
-		scaledInvTransform.SetDoubleAt(0, 0, invTransform.GetDoubleAt(0, 0)*0.5)
-		scaledInvTransform.SetDoubleAt(0, 1, invTransform.GetDoubleAt(0, 1)*0.5)
-		scaledInvTransform.SetDoubleAt(1, 0, invTransform.GetDoubleAt(1, 0)*0.5)
-		scaledInvTransform.SetDoubleAt(1, 1, invTransform.GetDoubleAt(1, 1)*0.5)
+	if workingSize != 128 {
+		// Scale factor: 128 / workingSize
+		// e.g., for 256: scale = 0.5, for 512: scale = 0.25
+		scale := 128.0 / float64(workingSize)
+		scaledInvTransform.SetDoubleAt(0, 0, invTransform.GetDoubleAt(0, 0)*scale)
+		scaledInvTransform.SetDoubleAt(0, 1, invTransform.GetDoubleAt(0, 1)*scale)
+		scaledInvTransform.SetDoubleAt(1, 0, invTransform.GetDoubleAt(1, 0)*scale)
+		scaledInvTransform.SetDoubleAt(1, 1, invTransform.GetDoubleAt(1, 1)*scale)
 		// Translation stays the same
 	}
 
@@ -189,7 +191,7 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 
 	// Create full white mask on the aligned face BEFORE warping
 	// (insightface style: img_white = np.full((aimg.shape[0],aimg.shape[1]), 255))
-	smallMask := gocv.NewMatWithSize(upscaledMaskSize, upscaledMaskSize, gocv.MatTypeCV8U)
+	smallMask := gocv.NewMatWithSize(workingSize, workingSize, gocv.MatTypeCV8U)
 	smallMask.SetTo(gocv.NewScalar(255, 0, 0, 0))
 	defer smallMask.Close()
 

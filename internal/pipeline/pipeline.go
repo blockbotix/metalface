@@ -549,14 +549,11 @@ func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 		// Align face based on model type
 		var aligned *swapper.AlignResult
 		var err error
-		var faceSize int
 
 		if p.modelType == ModelSimSwap512 {
 			aligned, err = p.aligner.AlignForSimSwap512(*frame, landmarks)
-			faceSize = 512
 		} else {
 			aligned, err = p.aligner.AlignForInswapper(*frame, landmarks)
-			faceSize = 128
 		}
 		if err != nil {
 			continue
@@ -583,16 +580,16 @@ func (p *Pipeline) processSwap(frame *gocv.Mat, faces []detector.Face) {
 		}
 
 		// Apply face enhancement if enabled
+		// GPEN outputs at higher resolution (256 or 512) - keep it at that resolution
+		// for better quality blending instead of resizing back down
 		faceToBlend := swappedFace
 		if p.enhancer != nil {
 			enhanced, err := p.enhancer.Enhance(swappedFace)
 			if err == nil {
-				// Resize enhanced face back to original swap size using high-quality interpolation
-				resized := gocv.NewMat()
-				gocv.Resize(enhanced, &resized, image.Pt(faceSize, faceSize), 0, 0, gocv.InterpolationLanczos4)
-				enhanced.Close()
+				// Use enhanced face at its native resolution (256 or 512)
+				// BlendFaceEnhanced will handle the different sizes properly
 				swappedFace.Close()
-				faceToBlend = resized
+				faceToBlend = enhanced
 			}
 			// If enhancement fails, fall back to unenhanced face
 		}
