@@ -145,17 +145,15 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 	// Could be: 128 (raw inswapper), 256 (GPEN-256 enhanced), 512 (GPEN-512/simswap)
 	faceSize := swappedFace.Rows()
 
-	// For 128x128 faces (raw inswapper without enhancement), apply slight blur then upscale
+	// For 128x128 faces (raw inswapper without enhancement), upscale for better quality warping
 	// For enhanced faces (256/512), use directly - they're already high quality
+	// NOTE: We do NOT blur the face pixels - insightface blurs the MASK for smooth transitions
 	faceToWarp := swappedFace
 	upscaledFace := gocv.NewMat()
 	workingSize := faceSize // The size we'll work with for warping
 	if faceSize == 128 {
-		// Apply subtle 3x3 Gaussian blur to smooth pixels before upscaling
-		blurredFace := gocv.NewMat()
-		gocv.GaussianBlur(swappedFace, &blurredFace, image.Pt(3, 3), 0.5, 0.5, gocv.BorderDefault)
-		gocv.Resize(blurredFace, &upscaledFace, image.Pt(256, 256), 0, 0, gocv.InterpolationLanczos4)
-		blurredFace.Close()
+		// Upscale without blurring face pixels - mask blur handles smooth transitions
+		gocv.Resize(swappedFace, &upscaledFace, image.Pt(256, 256), 0, 0, gocv.InterpolationLanczos4)
 		faceToWarp = upscaledFace
 		workingSize = 256
 	}
@@ -189,11 +187,18 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 		gocv.InterpolationLanczos4, gocv.BorderConstant, color.RGBA{0, 0, 0, 0})
 	defer warpedFace.Close()
 
-	// Create full white mask on the aligned face BEFORE warping
-	// (insightface style: img_white = np.full((aimg.shape[0],aimg.shape[1]), 255))
+	// Create elliptical mask on the aligned face BEFORE warping
+	// This produces smooth edges after warping (unlike a square which shows rotated corners)
+	// The ellipse is centered on the aligned face and covers most of it
 	smallMask := gocv.NewMatWithSize(workingSize, workingSize, gocv.MatTypeCV8U)
-	smallMask.SetTo(gocv.NewScalar(255, 0, 0, 0))
 	defer smallMask.Close()
+	// Draw ellipse centered in the aligned face space
+	// Use slightly smaller than full size to avoid edge artifacts
+	centerPt := image.Pt(workingSize/2, workingSize/2)
+	// Horizontal axis slightly wider for natural face shape
+	axes := image.Pt(int(float64(workingSize)*0.45), int(float64(workingSize)*0.48))
+	gocv.Ellipse(&smallMask, centerPt, axes, 0, 0, 360,
+		color.RGBA{R: 255, G: 255, B: 255, A: 255}, -1)
 
 	// Warp the mask using the same scaled inverse transform
 	warpedMask := gocv.NewMat()
@@ -227,10 +232,11 @@ func (b *Blender) BlendFaceEnhanced(swappedFace gocv.Mat, frame *gocv.Mat, trans
 	defer erodeKernel.Close()
 	gocv.Erode(warpedMask, &warpedMask, erodeKernel)
 
-	// Gaussian blur for soft edges (insightface: blur_size based on mask_size//20)
-	blurK := maskSize / 20
-	if blurK < 5 {
-		blurK = 5
+	// Gaussian blur for soft edges - insightface uses k = max(mask_size//20, 5), blur = 2*k+1
+	// We use slightly larger blur for smoother transitions since we don't blur face pixels
+	blurK := maskSize / 15 // More aggressive blur (was /20)
+	if blurK < 7 {
+		blurK = 7
 	}
 	blurSize := 2*blurK + 1 // ensure odd
 	gocv.GaussianBlur(warpedMask, &warpedMask, image.Pt(blurSize, blurSize), 0, 0, gocv.BorderDefault)

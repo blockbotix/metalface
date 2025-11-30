@@ -41,3 +41,5 @@ converted_coreml/
 *.pth
 modelinfo
 windowtest
+.venv/
+GPEN/

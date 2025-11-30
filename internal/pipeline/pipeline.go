@@ -26,10 +26,12 @@ type Config struct {
 	InswapperModelPath  string
 	SimSwap512ModelPath string // Path to SimSwap 512 model
 	EmapPath            string // Path to emap.bin for inswapper embedding transformation
-	GFPGANModelPath     string
-	GPEN256ModelPath    string // Path to GPEN-BFR-256 model (fast)
-	GPEN512ModelPath    string // Path to GPEN-BFR-512 model (balanced)
-	SourceImagePath     string
+	GFPGANModelPath      string
+	GPEN256ModelPath     string // Path to GPEN-BFR-256 model (fast)
+	GPEN512ModelPath     string // Path to GPEN-BFR-512 model (balanced)
+	RealESRGANModelPath  string // Path to Real-ESRGAN x4v3 model (fast upscaler)
+	CodeFormerModelPath  string // Path to CodeFormer model (high quality)
+	SourceImagePath      string
 	DetectionSize       int
 	ConfThreshold       float32
 	NMSThreshold        float32
@@ -295,6 +297,36 @@ func New(config Config) (*Pipeline, error) {
 					return nil, fmt.Errorf("failed to create GFPGAN enhancer: %w", err)
 				}
 				fmt.Println("  GFPGAN enhancer loaded")
+			}
+		case EnhancerRealESRGAN:
+			if config.RealESRGANModelPath != "" {
+				fmt.Println("  Loading Real-ESRGAN enhancer (fast 4x upscaler)...")
+				enh, err = enhancer.NewRealESRGAN(config.RealESRGANModelPath)
+				if err != nil {
+					faceDet.Close()
+					if landmarkDet != nil {
+						landmarkDet.Close()
+					}
+					enc.Close()
+					gen.Close()
+					return nil, fmt.Errorf("failed to create Real-ESRGAN enhancer: %w", err)
+				}
+				fmt.Println("  Real-ESRGAN enhancer loaded")
+			}
+		case EnhancerCodeFormer:
+			if config.CodeFormerModelPath != "" {
+				fmt.Println("  Loading CodeFormer enhancer (high quality)...")
+				enh, err = enhancer.NewCodeFormer(config.CodeFormerModelPath)
+				if err != nil {
+					faceDet.Close()
+					if landmarkDet != nil {
+						landmarkDet.Close()
+					}
+					enc.Close()
+					gen.Close()
+					return nil, fmt.Errorf("failed to create CodeFormer enhancer: %w", err)
+				}
+				fmt.Println("  CodeFormer enhancer loaded")
 			}
 		}
 	}

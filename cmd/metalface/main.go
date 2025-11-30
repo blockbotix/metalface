@@ -57,7 +57,7 @@ func parseFlags() Config {
 	flag.StringVar(&config.SourceImage, "s", "", "Source face image (shorthand)")
 	flag.IntVar(&config.CameraIndex, "camera", 0, "Camera device index")
 	flag.IntVar(&config.CameraIndex, "c", 0, "Camera device index (shorthand)")
-	flag.StringVar(&config.Enhancer, "enhance", "", "Face enhancer: gpen256 (fast), gpen512 (balanced), gfpgan (slow)")
+	flag.StringVar(&config.Enhancer, "enhance", "", "Face enhancer: realesrgan (fastest), gpen256 (fast), gpen512 (balanced), gfpgan, codeformer (best quality)")
 	flag.StringVar(&config.Enhancer, "e", "", "Face enhancer (shorthand)")
 	flag.BoolVar(&config.VirtualCam, "vcam", false, "Output to virtual camera")
 	flag.BoolVar(&config.VirtualCam, "v", false, "Output to virtual camera (shorthand)")
@@ -130,16 +130,20 @@ func run(config Config) error {
 	// Validate and convert enhancer type
 	var enhancerType pipeline.EnhancerType
 	switch config.Enhancer {
+	case "realesrgan":
+		enhancerType = pipeline.EnhancerRealESRGAN
 	case "gpen256":
 		enhancerType = pipeline.EnhancerGPEN256
 	case "gpen512":
 		enhancerType = pipeline.EnhancerGPEN512
 	case "gfpgan":
 		enhancerType = pipeline.EnhancerGFPGAN
+	case "codeformer":
+		enhancerType = pipeline.EnhancerCodeFormer
 	case "":
 		enhancerType = pipeline.EnhancerNone
 	default:
-		return fmt.Errorf("invalid enhancer: %s (use gpen256, gpen512, or gfpgan)", config.Enhancer)
+		return fmt.Errorf("invalid enhancer: %s (use realesrgan, gpen256, gpen512, gfpgan, or codeformer)", config.Enhancer)
 	}
 
 	// Create pipeline config
@@ -153,6 +157,8 @@ func run(config Config) error {
 		GFPGANModelPath:     gfpganPath,
 		GPEN256ModelPath:    "models/gpen_bfr_256.onnx",
 		GPEN512ModelPath:    "models/gpen_bfr_512.onnx",
+		RealESRGANModelPath: "models/realesr-general-x4v3.onnx",
+		CodeFormerModelPath: "models/codeformer.onnx",
 		SourceImagePath:     config.SourceImage,
 		DetectionSize:       640,
 		ConfThreshold:       0.5,

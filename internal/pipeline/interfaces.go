@@ -27,10 +27,12 @@ const (
 type EnhancerType string
 
 const (
-	EnhancerNone    EnhancerType = ""
-	EnhancerGFPGAN  EnhancerType = "gfpgan"
-	EnhancerGPEN256 EnhancerType = "gpen256"
-	EnhancerGPEN512 EnhancerType = "gpen512"
+	EnhancerNone       EnhancerType = ""
+	EnhancerGFPGAN     EnhancerType = "gfpgan"
+	EnhancerGPEN256    EnhancerType = "gpen256"
+	EnhancerGPEN512    EnhancerType = "gpen512"
+	EnhancerRealESRGAN EnhancerType = "realesrgan"
+	EnhancerCodeFormer EnhancerType = "codeformer"
 )
 
 // FaceDetector interface for face detection
